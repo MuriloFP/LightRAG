@@ -172,4 +172,13 @@ impl KVStorage for JsonKVStorage {
     async fn index_done_callback(&mut self) -> Result<()> {
         self.finalize().await
     }
-} 
+}
+
+/// Module for tracking and managing document processing status.
+/// 
+/// This module provides functionality to:
+/// - Track document processing states (Pending, Processing, Completed, Failed)
+/// - Store and retrieve document metadata
+/// - Query document status counts
+/// - Filter documents by status
+pub mod doc_status; 
