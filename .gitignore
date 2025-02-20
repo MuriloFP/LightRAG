@@ -63,6 +63,7 @@ gui/
 
 nano-vectordb/
 petgraph-graphml/
+docx-rs/
 
 # Rust-specific files
 rust/target/

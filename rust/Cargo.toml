@@ -58,6 +58,10 @@ nalgebra = "0.32"
 # Text processing
 tiktoken-rs = "0.5.8"
 
+# Document format handling
+pdf-extract = "0.8.2"  # PDF text extraction
+docx-rs = "0.4"        # Word document processing
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"

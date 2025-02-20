@@ -84,18 +84,37 @@ rust/
   - [x] Add character-based splitting support
   - [x] Add comprehensive test coverage
 
-- [ ] Document Format Support
-  - [ ] Plain text (.txt) handling
-  - [ ] Markdown (.md) processing
-  - [ ] PDF extraction support
-  - [ ] Word (.docx) document support
+- [x] Document Format Support
+  - [x] Create format handling module
+  - [x] Implement format detection system
+  - [x] Plain text (.txt) handling
+  - [x] Markdown (.md) processing
+  - [x] PDF extraction support
+  - [x] Word (.docx) document support
+  - [x] Add test utilities for file generation
+  - [x] Add comprehensive format-specific tests
 
 - [ ] Content Processing
   - [ ] Implement content cleaning utilities
+    - [ ] Remove unwanted characters
+    - [ ] Normalize whitespace
+    - [ ] Handle special characters
   - [ ] Add content validation
+    - [ ] Check content length
+    - [ ] Validate character encoding
+    - [ ] Check for malformed content
   - [ ] Create content summary generation
+    - [ ] Extract key sentences
+    - [ ] Generate abstracts
+    - [ ] Create metadata
   - [ ] Add error recovery mechanisms
+    - [ ] Handle parsing errors
+    - [ ] Implement retry logic
+    - [ ] Add fallback strategies
   - [ ] Implement content deduplication
+    - [ ] Detect duplicate content
+    - [ ] Handle near-duplicates
+    - [ ] Merge similar content
 
 ### 2.2 Vector Processing
 - [ ] Embedding Integration
@@ -105,17 +124,25 @@ rust/
   - [ ] Add retry mechanisms
 
 - [ ] Vector Management
-  - [ ] Implement vector normalization
-  - [ ] Add vector caching layer
-  - [ ] Create vector validation
-  - [ ] Add dimension checking
-  - [ ] Implement vector pruning
-
-- [ ] Performance Optimization
-  - [ ] Add batch processing for vectors
-  - [ ] Implement parallel embedding requests
-  - [ ] Create efficient vector storage
-  - [ ] Add vector compression (optional)
+  - [ ] Implement vector storage
+  - [ ] Add vector indexing
+  - [ ] Add similarity search
+  - [ ] Implement vector operations
+  - [ ] Add vector metadata management
+  - [ ] Add vector persistence
+  - [ ] Add vector batch operations
+  - [ ] Add vector deduplication
+  - [ ] Add vector compression
+  - [ ] Add vector quantization
+  - [ ] Add vector pruning
+  - [ ] Add vector normalization
+  - [ ] Add vector visualization
+  - [ ] Add vector export/import
+  - [ ] Add vector versioning
+  - [ ] Add vector caching
+  - [ ] Add vector monitoring
+  - [ ] Add vector backup/restore
+  - [ ] Add comprehensive test coverage
 
 ### 2.3 Graph Building
 - [ ] Entity Processing

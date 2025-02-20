@@ -10,6 +10,18 @@ mod status;
 mod chunking;
 mod types;
 
+/// Document format handling and text extraction.
+/// 
+/// This module provides functionality for:
+/// - Detecting document formats based on file extensions
+/// - Extracting text content from various document types
+/// - Supporting multiple formats including:
+///   - Plain text (.txt)
+///   - Markdown (.md)
+///   - PDF (.pdf)
+///   - Word documents (.docx)
+pub mod formats;
+
 pub use status::{
     DocumentStatus,
     DocumentMetadata,
@@ -26,6 +38,14 @@ pub use chunking::{
 pub use types::{
     TextChunk,
     ChunkingError,
+};
+
+pub use formats::{
+    DocumentFormat,
+    FormatHandler,
+    FormatError,
+    detect_format,
+    get_format_handler,
 };
 
 // Future processing functions and types will be added here. 
