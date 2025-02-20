@@ -1,5 +1,4 @@
-use async_trait::async_trait;
-use super_lightrag::storage::graph::{PetgraphStorage, EdgeData, NodeData, GraphStorage};
+use super_lightrag::storage::graph::{PetgraphStorage, EdgeData};
 use super_lightrag::types::{Config, Result};
 use serde_json::json;
 use std::collections::HashMap;

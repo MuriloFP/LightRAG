@@ -1,11 +1,9 @@
-use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
+use tempfile::TempDir;
 
-use super_lightrag::storage::vector::{NanoVectorStorage, VectorData};
-use super_lightrag::storage::vector::{SearchResult, UpsertResponse, VectorStorage};
-use super_lightrag::types::Config;
-use super_lightrag::types::Result;
+use super_lightrag::storage::vector::{NanoVectorStorage, VectorData, VectorStorage};
+use super_lightrag::types::{Config, Result};
 
 #[cfg(test)]
 mod tests {
@@ -13,8 +11,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_and_query() -> Result<()> {
-        // Create a default config
-        let config = Config::default();
+        // Create a temporary directory for testing
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut config = Config::default();
+        config.working_dir = temp_dir.path().to_path_buf();
+        
         let mut storage = NanoVectorStorage::new(&config)?;
         storage.initialize().await?;
 
@@ -34,7 +35,7 @@ mod tests {
         };
 
         // Upsert both vectors
-        let response: UpsertResponse = storage.upsert(vec![vec1.clone(), vec2.clone()]).await?;
+        let response = storage.upsert(vec![vec1.clone(), vec2.clone()]).await?;
         assert_eq!(response.inserted.len(), 2);
         assert_eq!(response.updated.len(), 0);
 
@@ -52,23 +53,68 @@ mod tests {
             vector: vec![0.9, 0.1, 0.0],
             metadata: meta2.clone(),
         };
-        let response2: UpsertResponse = storage.upsert(vec![vec2_updated.clone()]).await?;
-        assert_eq!(response2.updated.len(), 1);
-        assert_eq!(response2.inserted.len(), 0);
 
-        // Now query again; expect both vec1 and updated vec2 in the results
-        let results2 = storage.query(query_vec, 5).await?;
-        let ids: Vec<String> = results2.iter().map(|r| r.id.clone()).collect();
-        assert!(ids.contains(&"vec1".to_string()));
-        assert!(ids.contains(&"vec2".to_string()));
+        let response = storage.upsert(vec![vec2_updated]).await?;
+        assert_eq!(response.inserted.len(), 0);
+        assert_eq!(response.updated.len(), 1);
 
-        // Delete vec1
-        storage.delete(vec!["vec1".to_string()]).await?;
-        let results3 = storage.query(vec![1.0, 0.0, 0.0], 5).await?;
-        let ids_after_delete: Vec<String> = results3.iter().map(|r| r.id.clone()).collect();
-        assert!(!ids_after_delete.contains(&"vec1".to_string()), "vec1 should be deleted");
+        // Query again with the same vector
+        let results = storage.query(query_vec.clone(), 2).await?;
+        assert!(!results.is_empty(), "Query results should not be empty after reload");
+        assert_eq!(results[0].id, "vec1");
+        assert!(results[0].distance >= 0.9, "Expected high similarity for vec1 after reload");
 
-        storage.finalize().await?;
+        // Test deletion
+        storage.delete(vec!["vec2".to_string()]).await?;
+        let results = storage.query(query_vec, 2).await?;
+        assert_eq!(results.len(), 1, "Should only have one result after deletion");
+        assert_eq!(results[0].id, "vec1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_operations() -> Result<()> {
+        // Create a temporary directory for testing
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut config = Config::default();
+        config.working_dir = temp_dir.path().to_path_buf();
+        
+        let mut storage = NanoVectorStorage::new(&config)?;
+        storage.initialize().await?;
+
+        // Create a batch of test vectors
+        let mut vectors = Vec::new();
+        for i in 0..10 {
+            let mut metadata = HashMap::new();
+            metadata.insert("index".to_string(), json!(i));
+            vectors.push(VectorData {
+                id: format!("vec{}", i),
+                vector: vec![i as f32, (i + 1) as f32, (i + 2) as f32],
+                metadata,
+            });
+        }
+
+        // Insert batch
+        let response = storage.upsert(vectors).await?;
+        assert_eq!(response.inserted.len(), 10);
+        assert_eq!(response.updated.len(), 0);
+
+        // Query for nearest neighbors to vec5
+        let query_vec = vec![5.0, 6.0, 7.0];
+        let results = storage.query(query_vec.clone(), 3).await?;
+        assert_eq!(results.len(), 3, "Should get 3 nearest neighbors");
+        assert_eq!(results[0].id, "vec5", "First result should be vec5");
+
+        // Test batch deletion
+        let delete_ids = (0..5).map(|i| format!("vec{}", i)).collect();
+        storage.delete(delete_ids).await?;
+        
+        let results = storage.query(query_vec, 10).await?;
+        assert_eq!(results.len(), 5, "Should have 5 vectors remaining");
+        assert!(results.iter().all(|r| r.id.trim_start_matches("vec").parse::<i32>().unwrap() >= 5), 
+                "All remaining vectors should have id >= 5");
+
         Ok(())
     }
 } 

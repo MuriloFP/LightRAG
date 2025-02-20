@@ -87,9 +87,9 @@ impl KVStorage for JsonKVStorage {
         Ok(data.get(id).cloned())
     }
 
-    async fn get_by_ids(&self, ids: &[String]) -> Result<Vec<Option<Value>>> {
+    async fn get_by_ids(&self, ids: &[String]) -> Result<Vec<Value>> {
         let data = self.data.read().await;
-        Ok(ids.iter().map(|id| data.get(id).cloned()).collect())
+        Ok(ids.iter().filter_map(|id| data.get(id).cloned()).collect())
     }
 
     async fn filter_keys(&self, keys: &HashSet<String>) -> Result<HashSet<String>> {

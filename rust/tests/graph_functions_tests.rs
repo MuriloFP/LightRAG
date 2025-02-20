@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-use super_lightrag::storage::graph::petgraph_storage::{PetgraphStorage, GraphPattern, PatternMatch, EdgeData, NodeData};
+use super_lightrag::storage::graph::petgraph_storage::{PetgraphStorage, GraphPattern, EdgeData};
 use super_lightrag::storage::graph::GraphStorage;
 use super_lightrag::types::{Config, Result};
 

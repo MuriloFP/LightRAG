@@ -32,7 +32,7 @@ tracing-subscriber = "0.3"
 
 # Utils
 uuid = { version = "1.0", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 
 # WASM support
 wasm-bindgen = { version = "0.2", optional = true }
@@ -44,7 +44,7 @@ async-trait = "0.1"
 ndarray = "0.15"
 rand = "0.8"
 base64 = "0.21"
-md5 = "0.7"
+md5 = "0.7.0"
 bytemuck = "1.12"
 
 # Graph operations

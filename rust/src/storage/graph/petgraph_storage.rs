@@ -10,46 +10,69 @@ use petgraph::visit::EdgeRef;
 use petgraph::algo::astar;
 use std::collections::{HashSet, VecDeque};
 
+/// Data structure representing a node in the graph with its attributes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeData {
+    /// Unique identifier for the node.
     pub id: String,
+    /// Map of attribute key-value pairs associated with the node.
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
+/// Data structure representing an edge in the graph with its properties.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EdgeData {
+    /// Weight or strength of the connection between nodes.
     pub weight: f64,
+    /// Optional textual description of the relationship.
     pub description: Option<String>,
+    /// Optional list of keywords characterizing the relationship.
     pub keywords: Option<Vec<String>>,
 }
 
-// Struct for persistence serialization
+/// Serializable structure for persisting graph data to disk.
 #[derive(Serialize, Deserialize)]
 struct GraphPersistence {
-    nodes: Vec<(String, NodeData)>, // (id, NodeData)
-    edges: Vec<(String, String, EdgeData)>, // (source id, target id, EdgeData)
+    /// List of node tuples containing (id, NodeData).
+    nodes: Vec<(String, NodeData)>,
+    /// List of edge tuples containing (source id, target id, EdgeData).
+    edges: Vec<(String, String, EdgeData)>,
 }
 
+/// Main graph storage implementation using petgraph as the underlying graph structure.
 pub struct PetgraphStorage {
+    /// The core graph structure containing nodes and edges.
     pub graph: Graph<NodeData, EdgeData>,
+    /// Mapping from node IDs to their corresponding indices in the graph.
     pub node_map: HashMap<String, NodeIndex>,
+    /// Path to the file where the graph data is persisted.
     pub file_path: PathBuf,
 }
 
-/// A simple structure defining a graph pattern for matching.
+/// A pattern definition for matching subgraphs within the main graph.
 #[derive(Clone, Debug)]
 pub struct GraphPattern {
+    /// Optional keyword to match in edge properties.
     pub keyword: Option<String>,
+    /// Optional attribute name to match in node properties.
     pub node_attribute: Option<String>,
 }
 
-/// A structure representing a match result in the graph.
+/// Result structure containing matched nodes from a pattern search.
 #[derive(Clone, Debug)]
 pub struct PatternMatch {
+    /// List of node IDs that match the pattern criteria.
     pub node_ids: Vec<String>,
 }
 
 impl PetgraphStorage {
+    /// Creates a new PetgraphStorage instance.
+    /// 
+    /// # Arguments
+    /// * `config` - Configuration object containing working directory information
+    /// 
+    /// # Returns
+    /// A Result containing the new PetgraphStorage instance or an error
     pub fn new(config: &Config) -> Result<Self> {
         let file_path = config.working_dir.join("graph_storage.json");
         Ok(PetgraphStorage {
@@ -59,6 +82,10 @@ impl PetgraphStorage {
         })
     }
 
+    /// Persists the current state of the graph to disk.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the save operation
     pub fn save_graph(&self) -> Result<()> {
         let mut nodes_vec: Vec<(String, NodeData)> = Vec::new();
         for (id, &node_idx) in &self.node_map {
@@ -83,6 +110,10 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Loads the graph state from disk.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the load operation
     pub fn load_graph(&mut self) -> Result<()> {
         if self.file_path.exists() {
             let content = fs::read_to_string(&self.file_path)?;
@@ -102,6 +133,14 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Inserts or updates a node in the graph with the given attributes.
+    /// 
+    /// # Arguments
+    /// * `node_id` - Unique identifier for the node
+    /// * `attributes` - Map of attribute key-value pairs to associate with the node
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn upsert_node(&mut self, node_id: &str, attributes: HashMap<String, serde_json::Value>) -> Result<()> {
         if let Some(&node_idx) = self.node_map.get(node_id) {
             if let Some(node_data) = self.graph.node_weight_mut(node_idx) {
@@ -120,6 +159,15 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Inserts or updates an edge between two nodes with the given properties.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// * `data` - Edge properties to associate with the connection
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn upsert_edge(&mut self, source_id: &str, target_id: &str, data: EdgeData) -> Result<()> {
         // Ensure both nodes exist
         if !self.node_map.contains_key(source_id) {
@@ -140,6 +188,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Removes a node and all its incident edges from the graph.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node to delete
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn delete_node(&mut self, node_id: &str) -> Result<()> {
         if let Some(&node_idx) = self.node_map.get(node_id) {
             self.graph.remove_node(node_idx);
@@ -148,6 +203,14 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Removes an edge between two nodes from the graph.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn delete_edge(&mut self, source_id: &str, target_id: &str) -> Result<()> {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
             if let Some(edge_idx) = self.graph.find_edge(src_idx, tgt_idx) {
@@ -157,10 +220,25 @@ impl PetgraphStorage {
         Ok(())
     }
 
+    /// Checks if a node with the given ID exists in the graph.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node to check
+    /// 
+    /// # Returns
+    /// true if the node exists, false otherwise
     pub fn has_node(&self, node_id: &str) -> bool {
         self.node_map.contains_key(node_id)
     }
 
+    /// Checks if an edge exists between two nodes.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// true if the edge exists, false otherwise
     pub fn has_edge(&self, source_id: &str, target_id: &str) -> bool {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
             self.graph.find_edge(src_idx, tgt_idx).is_some()
@@ -169,6 +247,13 @@ impl PetgraphStorage {
         }
     }
 
+    /// Calculates the total degree (in + out) of a node.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node
+    /// 
+    /// # Returns
+    /// A Result containing the node's degree or an error
     pub fn node_degree(&self, node_id: &str) -> Result<usize> {
         if let Some(&idx) = self.node_map.get(node_id) {
             let out_deg = self.graph.edges_directed(idx, Direction::Outgoing).count();
@@ -179,7 +264,14 @@ impl PetgraphStorage {
         }
     }
 
-    /// Finds the shortest path from 'from_id' to 'to_id' using A* search with unit weights.
+    /// Finds the shortest path between two nodes using A* search algorithm.
+    /// 
+    /// # Arguments
+    /// * `from_id` - ID of the starting node
+    /// * `to_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// A Result containing a vector of node IDs representing the path, or an error if no path exists
     pub async fn find_path(&self, from_id: &str, to_id: &str) -> crate::types::Result<Vec<String>> {
         let start_idx = self.node_map.get(from_id)
             .ok_or_else(|| crate::types::Error::Storage(format!("Node {} not found", from_id)))?;
@@ -198,7 +290,14 @@ impl PetgraphStorage {
         }
     }
 
-    /// Returns the neighborhood (all nodes within the given depth) of a node using BFS.
+    /// Retrieves all nodes within a specified distance from a given node.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the starting node
+    /// * `depth` - Maximum distance to traverse from the starting node
+    /// 
+    /// # Returns
+    /// A Result containing a vector of NodeData for all nodes within the specified depth
     pub async fn get_neighborhood(&self, node_id: &str, depth: u32) -> crate::types::Result<Vec<NodeData>> {
         let start_idx = self.node_map.get(node_id)
             .ok_or_else(|| crate::types::Error::Storage(format!("Node {} not found", node_id)))?;
@@ -230,7 +329,13 @@ impl PetgraphStorage {
         Ok(result)
     }
 
-    /// Extracts an induced subgraph containing only the nodes with IDs in 'node_ids'.
+    /// Creates a new graph containing only the specified nodes and their interconnecting edges.
+    /// 
+    /// # Arguments
+    /// * `node_ids` - List of node IDs to include in the subgraph
+    /// 
+    /// # Returns
+    /// A Result containing a new PetgraphStorage instance representing the subgraph
     pub async fn extract_subgraph(&self, node_ids: &[String]) -> crate::types::Result<PetgraphStorage> {
         let node_set: HashSet<String> = node_ids.iter().cloned().collect();
         let mut new_graph = petgraph::Graph::<NodeData, EdgeData>::new();
@@ -264,7 +369,13 @@ impl PetgraphStorage {
         Ok(new_storage)
     }
 
-    /// Matches nodes in the graph based on the provided pattern.
+    /// Searches for nodes in the graph that match a specified pattern.
+    /// 
+    /// # Arguments
+    /// * `pattern` - Pattern criteria to match against nodes and edges
+    /// 
+    /// # Returns
+    /// A Result containing a vector of PatternMatch objects representing the matches found
     pub async fn match_pattern(&self, pattern: GraphPattern) -> crate::types::Result<Vec<PatternMatch>> {
         let mut matches = Vec::new();
         // A simple implementation: filter nodes where any attribute contains the keyword
@@ -283,12 +394,25 @@ impl PetgraphStorage {
         Ok(matches)
     }
 
-    /// Returns a clone of the node data for the node with the given id, if it exists.
+    /// Retrieves the data associated with a specific node.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node to retrieve
+    /// 
+    /// # Returns
+    /// Option containing the NodeData if the node exists, None otherwise
     pub fn get_node(&self, node_id: &str) -> Option<NodeData> {
         self.node_map.get(node_id).and_then(|&idx| self.graph.node_weight(idx).cloned())
     }
 
-    /// Returns a clone of the edge data between source_id and target_id, if such an edge exists.
+    /// Retrieves the data associated with an edge between two nodes.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// Option containing the EdgeData if the edge exists, None otherwise
     pub fn get_edge(&self, source_id: &str, target_id: &str) -> Option<EdgeData> {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
             self.graph.find_edge(src_idx, tgt_idx).and_then(|edge_idx| self.graph.edge_weight(edge_idx).cloned())
@@ -297,7 +421,13 @@ impl PetgraphStorage {
         }
     }
 
-    /// Returns all edges incident on the node with the given id as a vector of (source_id, target_id, EdgeData) tuples.
+    /// Retrieves all edges connected to a specific node.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node
+    /// 
+    /// # Returns
+    /// Option containing a vector of (source_id, target_id, EdgeData) tuples for all incident edges
     pub fn get_node_edges(&self, node_id: &str) -> Option<Vec<(String, String, EdgeData)>> {
         if let Some(&idx) = self.node_map.get(node_id) {
             let mut result = Vec::new();
@@ -316,7 +446,14 @@ impl PetgraphStorage {
     // Filtering Methods
     // ---------------------------------------------
 
-    /// Returns all nodes for which the given attribute's string value contains the specified substring.
+    /// Finds nodes that have a specific attribute containing a given value.
+    /// 
+    /// # Arguments
+    /// * `attribute` - Name of the attribute to search
+    /// * `value` - Value to search for within the attribute
+    /// 
+    /// # Returns
+    /// Vector of NodeData for all nodes matching the search criteria
     pub fn filter_nodes_by_attribute(&self, attribute: &str, value: &str) -> Vec<NodeData> {
         self.graph.node_weights()
             .filter(|node| {
@@ -331,8 +468,13 @@ impl PetgraphStorage {
             .collect()
     }
 
-    /// Returns all edges (as (source_id, target_id, EdgeData)) for which either the 'description' or any of the 'keywords'
-    /// contains the provided substring.
+    /// Finds edges where either the description or keywords contain a specific value.
+    /// 
+    /// # Arguments
+    /// * `value` - Value to search for in edge descriptions and keywords
+    /// 
+    /// # Returns
+    /// Vector of (source_id, target_id, EdgeData) tuples for all matching edges
     pub fn filter_edges_by_attribute(&self, value: &str) -> Vec<(String, String, EdgeData)> {
         self.graph.edge_references()
             .filter(|edge| {
@@ -362,8 +504,14 @@ impl PetgraphStorage {
             .collect()
     }
 
-    /// Returns the combined degree of an edge by summing the degrees of its endpoints.
-    /// This mimics LightRAG's edge_degree computation (i.e., degree(src) + degree(tgt)).
+    /// Calculates the combined degree of an edge by summing the degrees of its endpoints.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// A Result containing the combined degree or an error if the edge doesn't exist
     pub fn edge_degree(&self, source_id: &str, target_id: &str) -> crate::types::Result<usize> {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
             let deg_src = self.graph.edges(src_idx).count();
@@ -378,7 +526,13 @@ impl PetgraphStorage {
     // Batch Operations and Cascading Deletion
     // ---------------------------------------------
 
-    /// Batch upsert nodes from a vector of (node_id, attributes).
+    /// Performs batch insertion or update of multiple nodes.
+    /// 
+    /// # Arguments
+    /// * `nodes` - Vector of (node_id, attributes) pairs to upsert
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn upsert_nodes(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> crate::types::Result<()> {
         for (node_id, attrs) in nodes {
             self.upsert_node(&node_id, attrs)?;
@@ -386,7 +540,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Batch upsert edges from a vector of (source_id, target_id, EdgeData).
+    /// Performs batch insertion or update of multiple edges.
+    /// 
+    /// # Arguments
+    /// * `edges` - Vector of (source_id, target_id, EdgeData) tuples to upsert
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn upsert_edges(&mut self, edges: Vec<(String, String, EdgeData)>) -> crate::types::Result<()> {
         for (src, tgt, data) in edges {
             self.upsert_edge(&src, &tgt, data)?;
@@ -394,7 +554,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Batch delete nodes given a vector of node IDs.
+    /// Deletes multiple nodes in a single operation.
+    /// 
+    /// # Arguments
+    /// * `node_ids` - Vector of node IDs to delete
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn delete_nodes_batch(&mut self, node_ids: Vec<String>) -> crate::types::Result<()> {
         for node_id in node_ids {
             self.delete_node(&node_id)?;
@@ -402,7 +568,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Batch delete edges given a vector of (source_id, target_id) tuples.
+    /// Deletes multiple edges in a single operation.
+    /// 
+    /// # Arguments
+    /// * `edges` - Vector of (source_id, target_id) pairs representing edges to delete
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn delete_edges_batch(&mut self, edges: Vec<(String, String)>) -> crate::types::Result<()> {
         for (src, tgt) in edges {
             self.delete_edge(&src, &tgt)?;
@@ -410,7 +582,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Cascading deletion of a node. Deletes the node and then updates any other node that references this node in its "source_id" attribute.
+    /// Deletes a node and updates any nodes that reference it in their source_id attribute.
+    /// 
+    /// # Arguments
+    /// * `node_id` - ID of the node to delete
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the operation
     pub fn cascading_delete_node(&mut self, node_id: &str) -> crate::types::Result<()> {
         // Delete the node (incident edges are removed automatically by remove_node)
         self.delete_node(node_id)?;
@@ -434,7 +612,10 @@ impl PetgraphStorage {
     // Helper Methods and Default Values
     // ---------------------------------------------
 
-    /// Returns default edge properties when an edge is not found
+    /// Returns default edge properties for when an edge is not found.
+    /// 
+    /// # Returns
+    /// A new EdgeData instance with default values
     pub fn default_edge_properties() -> EdgeData {
         EdgeData {
             weight: 0.0,
@@ -443,37 +624,58 @@ impl PetgraphStorage {
         }
     }
 
-    /// Encodes a node label to handle special characters
-    /// This is a simple implementation that could be extended based on needs
+    /// Encodes a node label to handle special characters.
+    /// 
+    /// # Arguments
+    /// * `label` - Label to encode
+    /// 
+    /// # Returns
+    /// The encoded label as a String
     pub fn encode_node_label(label: &str) -> String {
         // For now, just trim quotes and return as is
         // Could be extended to handle special characters if needed
         label.trim_matches('"').to_string()
     }
 
-    /// Decodes an encoded node label
-    /// This is a simple implementation that could be extended based on needs
+    /// Decodes an encoded node label.
+    /// 
+    /// # Arguments
+    /// * `encoded_label` - Previously encoded label to decode
+    /// 
+    /// # Returns
+    /// The decoded label as a String
     pub fn decode_node_label(encoded_label: &str) -> String {
         // For now, just return as is
         // Could be extended to handle special characters if needed
         encoded_label.to_string()
     }
 
-    /// Called after indexing operations are complete
-    /// This is where we ensure the graph is persisted
+    /// Callback function executed after indexing operations are complete.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of post-indexing operations
     pub async fn index_done_callback(&mut self) -> crate::types::Result<()> {
         self.save_graph()?;
         Ok(())
     }
 
-    /// Returns a clone of the edge data between source_id and target_id.
-    /// If no edge exists, returns default edge properties.
+    /// Retrieves edge data between two nodes, returning default properties if no edge exists.
+    /// 
+    /// # Arguments
+    /// * `source_id` - ID of the source node
+    /// * `target_id` - ID of the target node
+    /// 
+    /// # Returns
+    /// EdgeData for the edge if it exists, or default edge properties
     pub fn get_edge_with_default(&self, source_id: &str, target_id: &str) -> EdgeData {
         self.get_edge(source_id, target_id)
             .unwrap_or_else(|| Self::default_edge_properties())
     }
 
-    /// Reorders the graph nodes and edges to provide a stable ordering for consistent reads.
+    /// Reorders graph nodes and edges to provide a stable ordering for consistent reads.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of the stabilization operation
     pub fn stabilize_graph(&mut self) -> crate::types::Result<()> {
         let mut new_graph = Graph::<NodeData, EdgeData>::new();
         let mut new_node_map = HashMap::new();
@@ -518,8 +720,13 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Generates a simple embedding for each node using a dummy node2vec-like approach.
-    /// This method creates an embedding vector for each node based on a simple hash of its id, for demonstration purposes.
+    /// Generates simple embeddings for nodes using a basic node2vec-like approach.
+    /// 
+    /// # Arguments
+    /// * `dimension` - Dimensionality of the embeddings to generate
+    /// 
+    /// # Returns
+    /// A Result containing a tuple of (embeddings vector, node IDs vector)
     pub async fn embed_nodes(&self, dimension: usize) -> crate::types::Result<(Vec<f32>, Vec<String>)> {
         // Collect node ids and sort them for consistency
         let mut node_ids: Vec<String> = self.graph.node_weights().map(|node| node.id.clone()).collect();
@@ -540,11 +747,19 @@ impl PetgraphStorage {
 
 #[async_trait]
 impl crate::storage::graph::GraphStorage for PetgraphStorage {
+    /// Initializes the graph storage by loading data from disk.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of initialization
     async fn initialize(&mut self) -> Result<()> {
         self.load_graph()?;
         Ok(())
     }
 
+    /// Finalizes the graph storage by saving data to disk.
+    /// 
+    /// # Returns
+    /// A Result indicating success or failure of finalization
     async fn finalize(&mut self) -> Result<()> {
         self.save_graph()?;
         Ok(())

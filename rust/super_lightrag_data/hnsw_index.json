@@ -1,0 +1,10 @@
+{
+  "nodes": [],
+  "entry_point": null,
+  "max_layers": 1,
+  "ef_construction": 128,
+  "m": 16,
+  "batch_size": 100,
+  "sync_threshold": 1000,
+  "updates_since_sync": 0
+}
