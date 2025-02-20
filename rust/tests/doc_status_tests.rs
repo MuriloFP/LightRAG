@@ -186,4 +186,38 @@ async fn test_integration_kv_and_doc_status() -> Result<()> {
 
     doc_storage.finalize().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn test_get_status_counts_unused_statuses() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let mut config = Config::default();
+    config.working_dir = temp_dir.path().to_path_buf();
+
+    let mut storage = JsonDocStatusStorage::new(&config, "doc_status_counts_unused")?;
+    storage.initialize().await?;
+
+    // Add only one document with "Pending" status
+    let mut data = HashMap::new();
+    let mut doc = HashMap::new();
+    doc.insert("status".to_string(), json!("Pending"));
+    data.insert("doc1".to_string(), doc);
+    storage.upsert(data).await?;
+
+    // Get counts and verify all statuses are present
+    let counts = storage.get_status_counts().await?;
+    
+    // Verify used status has correct count
+    assert_eq!(counts.get("Pending"), Some(&1));
+    
+    // Verify unused statuses are present with count 0
+    assert_eq!(counts.get("Processing"), Some(&0));
+    assert_eq!(counts.get("Completed"), Some(&0));
+    assert_eq!(counts.get("Failed"), Some(&0));
+    
+    // Verify total number of status types
+    assert_eq!(counts.len(), 4);
+
+    storage.finalize().await?;
+    Ok(())
 } 

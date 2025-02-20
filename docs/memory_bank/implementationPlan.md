@@ -14,6 +14,10 @@
    - [x] Add serialization/deserialization
    - [x] Implement persistence layer
    - [x] Add caching mechanisms (in-memory HashMap used as cache)
+   - [x] Add thread-safe locking mechanism
+   - [x] Implement document status tracking
+   - [x] Add namespace support
+   - [x] Add batch operations
 
 2. **NanoVectorDB-RS**
    - [x] Port core NanoVectorDB functionality

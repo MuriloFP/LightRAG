@@ -89,9 +89,7 @@ impl JsonDocStatusStorage {
         let _guard = self.inner.lock.lock().await;
         info!(namespace = %self.inner.namespace, count = data.len(), "DocStatus upsert: Inserting/Updating data");
         // For each key-value pair in data, update (or insert) directly in the inner map
-        for (k, v) in data.into_iter() {
-            self.inner.data.insert(k, v);
-        }
+        self.inner.data.extend(data);
         // Drop the guard to release the immutable borrow before calling a mutable method
         drop(_guard);
         // Persist changes by calling index_done_callback
@@ -100,9 +98,18 @@ impl JsonDocStatusStorage {
 
     /// Returns counts of documents in each status.
     /// Assumes that each document is stored as a HashMap where a key "status" holds a string value.
+    /// Matches LightRAG's behavior by initializing counts for all possible statuses to 0.
     pub async fn get_status_counts(&self) -> Result<HashMap<String, i32>> {
         let _guard = self.inner.lock.lock().await;
-        let mut counts: HashMap<String, i32> = HashMap::new();
+        // Initialize counts for all possible statuses
+        let mut counts: HashMap<String, i32> = [
+            ("Pending".to_string(), 0),
+            ("Processing".to_string(), 0),
+            ("Completed".to_string(), 0),
+            ("Failed".to_string(), 0),
+        ].into_iter().collect();
+        
+        // Count documents by status
         for doc in self.inner.data.values() {
             if let Some(status_value) = doc.get("status") {
                 if let Some(status_str) = status_value.as_str() {
