@@ -3,7 +3,6 @@ use crate::types::{Result, Config, Error};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
-use std::fs;
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::Direction;
 use petgraph::visit::EdgeRef;
@@ -12,6 +11,9 @@ use std::collections::{HashSet, VecDeque};
 use super::embeddings::{EmbeddingAlgorithm, Node2VecConfig, generate_node2vec_embeddings};
 use crate::storage::graph::GraphStorage;
 use tokio::task::JoinError;
+use tracing::info;
+use std::fmt;
+use super::graphml::GraphMlHandler;
 
 /// Data structure representing a node in the graph with its attributes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -50,6 +52,7 @@ pub struct PetgraphStorage {
     pub node_map: HashMap<String, NodeIndex>,
     /// Path to the file where the graph data is persisted.
     pub file_path: PathBuf,
+    embedding_handlers: HashMap<&'static str, fn(&petgraph::graph::Graph<crate::storage::graph::NodeData, crate::storage::graph::EdgeData>) -> Result<(Vec<f32>, Vec<petgraph::graph::NodeIndex>)>>,
 }
 
 /// A pattern definition for matching subgraphs within the main graph.
@@ -74,6 +77,18 @@ impl From<JoinError> for crate::types::Error {
     }
 }
 
+impl fmt::Display for NodeData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", serde_json::to_string(self).unwrap_or_default())
+    }
+}
+
+impl fmt::Display for EdgeData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", serde_json::to_string(self).unwrap_or_default())
+    }
+}
+
 impl PetgraphStorage {
     /// Creates a new PetgraphStorage instance.
     /// 
@@ -83,61 +98,128 @@ impl PetgraphStorage {
     /// # Returns
     /// A Result containing the new PetgraphStorage instance or an error
     pub fn new(config: &Config) -> Result<Self> {
-        let file_path = config.working_dir.join("graph_storage.json");
+        let file_path = config.working_dir.join(format!("graph_storage.graphml"));
+        let mut embedding_handlers: HashMap<&'static str, fn(&petgraph::graph::Graph<crate::storage::graph::NodeData, crate::storage::graph::EdgeData>) -> Result<(Vec<f32>, Vec<petgraph::graph::NodeIndex>)>> = HashMap::new();
+        embedding_handlers.insert("node2vec", node2vec_handler);
         Ok(PetgraphStorage {
             graph: Graph::<NodeData, EdgeData>::new(),
             node_map: HashMap::new(),
             file_path,
+            embedding_handlers,
         })
     }
 
-    /// Persists the current state of the graph to disk.
-    /// 
-    /// # Returns
-    /// A Result indicating success or failure of the save operation
-    pub fn save_graph(&self) -> Result<()> {
-        let mut nodes_vec: Vec<(String, NodeData)> = Vec::new();
-        for (id, &node_idx) in &self.node_map {
-            if let Some(node_data) = self.graph.node_weight(node_idx) {
-                nodes_vec.push((id.clone(), node_data.clone()));
+    /// Stabilizes the graph to ensure consistent ordering.
+    /// This matches LightRAG's stabilization functionality.
+    pub fn stabilize_graph(&mut self) -> Result<()> {
+        // Log the state before stabilization (if not already logged earlier)
+        tracing::info!("Stabilizing graph: {} nodes, {} edges", self.graph.node_count(), self.graph.edge_count());
+
+        // Create a new graph with stable ordering
+        let mut new_graph = Graph::<NodeData, EdgeData>::new();
+        let mut new_node_map = HashMap::new();
+
+        // Add nodes in sorted order
+        let mut sorted_nodes: Vec<_> = self.node_map.iter().collect();
+        sorted_nodes.sort_by(|(id1, _), (id2, _)| id1.cmp(id2));
+        // Debug assertion for node order
+        for window in sorted_nodes.windows(2) {
+            debug_assert!(window[0].0 <= window[1].0, "Nodes not sorted: {} > {}", window[0].0, window[1].0);
+        }
+
+        for (id, &old_idx) in sorted_nodes {
+            if let Some(node_data) = self.graph.node_weight(old_idx) {
+                let new_idx = new_graph.add_node(node_data.clone());
+                new_node_map.insert(id.clone(), new_idx);
             }
         }
-        let mut edges_vec: Vec<(String, String, EdgeData)> = Vec::new();
+
+        // Add edges in sorted order
+        let mut edges = Vec::new();
         for edge in self.graph.edge_references() {
-            let src = edge.source();
-            let tgt = edge.target();
-            if let (Some(src_data), Some(tgt_data)) = (self.graph.node_weight(src), self.graph.node_weight(tgt)) {
-                edges_vec.push((src_data.id.clone(), tgt_data.id.clone(), edge.weight().clone()));
+            let source = &self.graph[edge.source()].id;
+            let target = &self.graph[edge.target()].id;
+            let edge_data = edge.weight().clone();
+            
+            // For undirected graphs, ensure consistent source/target ordering
+            let (src, tgt, data) = if !self.graph.is_directed() && source > target {
+                (target, source, edge_data)
+            } else {
+                (source, target, edge_data)
+            };
+            
+            edges.push((src.clone(), tgt.clone(), data));
+        }
+
+        // Sort edges by source->target key
+        edges.sort_by(|(src1, tgt1, _), (src2, tgt2, _)| {
+            let key1 = format!("{} -> {}", src1, tgt1);
+            let key2 = format!("{} -> {}", src2, tgt2);
+            key1.cmp(&key2)
+        });
+        // Debug assertion for edge order
+        for window in edges.windows(2) {
+            let key1 = format!("{} -> {}", window[0].0, window[0].1);
+            let key2 = format!("{} -> {}", window[1].0, window[1].1);
+            debug_assert!(key1 <= key2, "Edges not sorted: {} > {}", key1, key2);
+        }
+
+        // Add sorted edges to new graph
+        for (src, tgt, data) in edges {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (new_node_map.get(&src), new_node_map.get(&tgt)) {
+                new_graph.add_edge(src_idx, tgt_idx, data);
             }
         }
-        let persistence = GraphPersistence {
-            nodes: nodes_vec,
-            edges: edges_vec,
-        };
-        let content = serde_json::to_string_pretty(&persistence)?;
-        fs::write(&self.file_path, content)?;
+
+        // Replace old graph with stabilized version
+        self.graph = new_graph;
+        self.node_map = new_node_map;
+
+        // Log the state after stabilization
+        tracing::info!("Graph stabilized: {} nodes, {} edges", self.graph.node_count(), self.graph.edge_count());
+
+        // Collect node IDs from the graph
+        let node_ids: Vec<String> = self.graph.node_weights().map(|n| n.id.clone()).collect();
+        // Create a sorted copy
+        let mut sorted_ids = node_ids.clone();
+        sorted_ids.sort();
+        // Debug assertion to ensure the nodes are in sorted order
+        debug_assert_eq!(node_ids, sorted_ids, "Node IDs are not sorted after stabilization");
+
         Ok(())
     }
 
-    /// Loads the graph state from disk.
-    /// 
-    /// # Returns
-    /// A Result indicating success or failure of the load operation
+    /// Saves the graph to disk in GraphML format.
+    pub fn save_graph(&self) -> Result<()> {
+        // Create a GraphMl instance with pretty printing enabled
+        let handler = GraphMlHandler::new(self.graph.clone()).pretty_print(true);
+        handler.write_graphml(&self.file_path)?;
+        info!("Saved graph to {}", self.file_path.display());
+        Ok(())
+    }
+
+    /// Loads the graph from disk in GraphML format.
     pub fn load_graph(&mut self) -> Result<()> {
         if self.file_path.exists() {
-            let content = fs::read_to_string(&self.file_path)?;
-            let persistence: GraphPersistence = serde_json::from_str(&content)?;
-            self.graph = Graph::<NodeData, EdgeData>::new();
+            // Load graph from GraphML file
+            let graph = GraphMlHandler::read_graphml(&self.file_path)
+                .map_err(|e| Error::Storage(format!("Failed to parse GraphML: {}", e)))?;
+            
+            // Update internal state
+            self.graph = graph;
+            
+            // Rebuild node map
             self.node_map.clear();
-            for (_, node_data) in persistence.nodes {
-                let idx = self.graph.add_node(node_data.clone());
-                self.node_map.insert(node_data.id.clone(), idx);
-            }
-            for (src_id, tgt_id, edge_data) in persistence.edges {
-                if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(&src_id), self.node_map.get(&tgt_id)) {
-                    self.graph.add_edge(src_idx, tgt_idx, edge_data);
+            for node_idx in self.graph.node_indices() {
+                if let Some(node_data) = self.graph.node_weight(node_idx) {
+                    self.node_map.insert(node_data.id.clone(), node_idx);
                 }
             }
+            
+            info!("Loaded graph from {} with {} nodes and {} edges", 
+                  self.file_path.display(),
+                  self.graph.node_count(),
+                  self.graph.edge_count());
         }
         Ok(())
     }
@@ -266,9 +348,9 @@ impl PetgraphStorage {
         tokio::task::spawn_blocking(move || {
             if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
                 graph.find_edge(src_idx, tgt_idx).is_some()
-            } else {
-                false
-            }
+        } else {
+            false
+        }
         }).await.unwrap_or(false)
     }
 
@@ -390,6 +472,7 @@ impl PetgraphStorage {
             graph: new_graph,
             node_map: new_node_map,
             file_path: self.file_path.clone(),
+            embedding_handlers: self.embedding_handlers.clone(),
         };
         Ok(new_storage)
     }
@@ -429,9 +512,15 @@ impl PetgraphStorage {
     /// Option containing the EdgeData if the edge exists, None otherwise
     pub fn get_edge(&self, source_id: &str, target_id: &str) -> Option<EdgeData> {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
-            self.graph.find_edge(src_idx, tgt_idx).and_then(|edge_idx| self.graph.edge_weight(edge_idx).cloned())
+            self.graph.find_edge(src_idx, tgt_idx)
+                .and_then(|edge_idx| self.graph.edge_weight(edge_idx).cloned())
         } else {
-            None
+            // Return default edge properties when no edge found
+            Some(EdgeData {
+                weight: 0.0,
+                description: None,
+                keywords: None,
+            })
         }
     }
 
@@ -548,9 +637,31 @@ impl PetgraphStorage {
     /// # Returns
     /// A Result indicating success or failure of the operation
     pub async fn upsert_nodes_impl(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> crate::types::Result<()> {
-        for (node_id, attrs) in nodes {
-            self.upsert_node_impl(&node_id, attrs).await?;
-        }
+        let mut graph = self.graph.clone();
+        let mut node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for (node_id, attrs) in nodes {
+                if let Some(&node_idx) = node_map.get(&node_id) {
+                    if let Some(node_data) = graph.node_weight_mut(node_idx) {
+                        for (k, v) in attrs {
+                            node_data.attributes.insert(k, v);
+                        }
+                    }
+                } else {
+                    let node_data = NodeData {
+                        id: node_id.clone(),
+                        attributes: attrs,
+                    };
+                    let idx = graph.add_node(node_data);
+                    node_map.insert(node_id, idx);
+                }
+            }
+            (graph, node_map)
+        }).await?;
+
+        self.graph = result.0;
+        self.node_map = result.1;
         Ok(())
     }
 
@@ -562,9 +673,25 @@ impl PetgraphStorage {
     /// # Returns
     /// A Result indicating success or failure of the operation
     pub async fn upsert_edges_impl(&mut self, edges: Vec<(String, String, EdgeData)>) -> crate::types::Result<()> {
-        for (src, tgt, data) in edges {
-            self.upsert_edge_impl(&src, &tgt, data).await?;
-        }
+        let mut graph = self.graph.clone();
+        let node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for (src, tgt, data) in edges {
+                if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&src), node_map.get(&tgt)) {
+                    if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
+                        if let Some(weight) = graph.edge_weight_mut(edge_idx) {
+                            *weight = data;
+                        }
+                    } else {
+                        graph.add_edge(src_idx, tgt_idx, data);
+                    }
+                }
+            }
+            graph
+        }).await?;
+
+        self.graph = result;
         Ok(())
     }
 
@@ -580,12 +707,12 @@ impl PetgraphStorage {
         let mut node_map = self.node_map.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            for node_id in node_ids {
+        for node_id in node_ids {
                 if let Some(&idx) = node_map.get(&node_id) {
                     graph.remove_node(idx);
                     node_map.remove(&node_id);
                 }
-            }
+        }
             (graph, node_map)
         }).await?;
 
@@ -704,69 +831,26 @@ impl PetgraphStorage {
             .unwrap_or_else(|| Self::default_edge_properties())
     }
 
-    /// Reorders graph nodes and edges to provide a stable ordering for consistent reads.
-    /// 
-    /// # Returns
-    /// A Result indicating success or failure of the stabilization operation
-    pub fn stabilize_graph(&mut self) -> crate::types::Result<()> {
-        let mut new_graph = Graph::<NodeData, EdgeData>::new();
-        let mut new_node_map = HashMap::new();
-        
-        // Collect and sort nodes by their id for a consistent ordering
-        let mut nodes: Vec<&NodeData> = self.graph.node_weights().collect();
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        
-        // Add nodes to the new graph in sorted order and build new node_map
-        for node in nodes {
-            let new_idx = new_graph.add_node(node.clone());
-            new_node_map.insert(node.id.clone(), new_idx);
-        }
-        
-        // Build a mapping from old NodeIndex to new NodeIndex
-        let mut index_mapping: HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> = HashMap::new();
-        for (id, old_idx) in &self.node_map {
-            if let Some(new_idx) = new_node_map.get(id) {
-                index_mapping.insert(*old_idx, *new_idx);
-            }
-        }
-        
-        // Collect and sort edges by (source id, target id) for consistent ordering
-        let mut edges: Vec<_> = self.graph.edge_references().collect();
-        edges.sort_by(|a, b| {
-            let src_a = self.graph[a.source()].id.clone();
-            let tgt_a = self.graph[a.target()].id.clone();
-            let src_b = self.graph[b.source()].id.clone();
-            let tgt_b = self.graph[b.target()].id.clone();
-            src_a.cmp(&src_b).then(tgt_a.cmp(&tgt_b))
-        });
-        
-        // Add edges to the new graph only if both endpoints exist in the new mapping
-        for edge in edges {
-            if let (Some(&new_src), Some(&new_tgt)) = (index_mapping.get(&edge.source()), index_mapping.get(&edge.target())) {
-                new_graph.add_edge(new_src, new_tgt, edge.weight().clone());
-            }
-        }
-        
-        self.graph = new_graph;
-        self.node_map = new_node_map;
-        Ok(())
-    }
-
     /// Generate embeddings for all nodes in the graph using the specified algorithm
-    pub fn embed_nodes(&self, algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>)> {
-        match algorithm {
-            EmbeddingAlgorithm::Node2Vec => {
-                let config = Node2VecConfig::default();
-                let (embeddings, indices) = generate_node2vec_embeddings(&self.graph, &config)?;
-                
-                // Convert node indices to node IDs
-                let node_ids = indices.into_iter()
-                    .filter_map(|idx| self.graph.node_weight(idx).map(|node| node.id.clone()))
-                    .collect();
-                
-                Ok((embeddings, node_ids))
-            }
-        }
+    pub async fn embed_nodes(&self, algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>)> {
+        // Map the EmbeddingAlgorithm enum to a dictionary key string
+        let algorithm_key = match algorithm {
+            EmbeddingAlgorithm::Node2Vec => "node2vec",
+            // Future algorithms can be added here
+        };
+        
+        // Get the handler from the dictionary
+        let handler = *self.embedding_handlers.get(algorithm_key).ok_or_else(|| crate::types::Error::Storage(format!("Embedding algorithm not supported: {}", algorithm_key)))?;
+        let graph = self.graph.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let (embeddings, indices) = handler(&graph)?;
+            // Convert node indices to node IDs
+            let node_ids = indices.into_iter()
+                .filter_map(|idx| graph.node_weight(idx).map(|node| node.id.clone()))
+                .collect();
+            Ok((embeddings, node_ids))
+        }).await?
     }
 
     /// Generate embeddings with custom configuration
@@ -784,7 +868,7 @@ impl PetgraphStorage {
                     .filter_map(|idx| self.graph.node_weight(idx).map(|node| node.id.clone()))
                     .collect();
                 
-                Ok((embeddings, node_ids))
+        Ok((embeddings, node_ids))
             }
         }
     }
@@ -792,75 +876,64 @@ impl PetgraphStorage {
 
 #[async_trait]
 impl GraphStorage for PetgraphStorage {
-    async fn initialize(&mut self) -> Result<()> {
+    async fn finalize(&mut self) -> Result<()> {
+        // Create handler and write with pretty printing
+        let handler = GraphMlHandler::new(self.graph.clone()).pretty_print(true);
         let file_path = self.file_path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            if file_path.exists() {
-                let content = fs::read_to_string(&file_path)?;
-                let persistence: GraphPersistence = serde_json::from_str(&content)?;
-                let mut graph = Graph::<NodeData, EdgeData>::new();
-                let mut node_map = HashMap::new();
-                
-                // Add nodes
-                for (id, node_data) in persistence.nodes {
-                    let idx = graph.add_node(node_data.clone());
-                    node_map.insert(id.clone(), idx);
-                }
-                
-                // Add edges
-                for (src_id, tgt_id, edge_data) in persistence.edges {
-                    if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&src_id), node_map.get(&tgt_id)) {
-                        graph.add_edge(src_idx, tgt_idx, edge_data);
-                    }
-                }
-                
-                Ok((graph, node_map))
-            } else {
-                Ok((Graph::<NodeData, EdgeData>::new(), HashMap::new()))
-            }
-        }).await?;
         
-        match result {
-            Ok((graph, node_map)) => {
-                self.graph = graph;
-                self.node_map = node_map;
-                Ok(())
-            }
-            Err(e) => Err(e)
+        info!("Saving graph with {} nodes and {} edges to {}", 
+              self.graph.node_count(), 
+              self.graph.edge_count(),
+              file_path.display());
+
+        // Write graph to file
+        tokio::task::spawn_blocking(move || {
+            handler.write_graphml(&file_path)
+        }).await??;
+
+        // Verify file was written
+        let check_path = self.file_path.clone();
+        if !check_path.exists() {
+            return Err(Error::Storage("Failed to write graph file".to_string()));
         }
+
+        info!("Successfully saved graph to {}", self.file_path.display());
+        Ok(())
     }
 
-    async fn finalize(&mut self) -> Result<()> {
-        let graph = self.graph.clone();
-        let node_map = self.node_map.clone();
-        let file_path = self.file_path.clone();
+    async fn initialize(&mut self) -> Result<()> {
+        info!("Initializing graph storage from {}", self.file_path.display());
         
-        tokio::task::spawn_blocking(move || {
-            let mut nodes_vec = Vec::new();
-            for (id, &node_idx) in &node_map {
-                if let Some(node_data) = graph.node_weight(node_idx) {
-                    nodes_vec.push((id.clone(), node_data.clone()));
-                }
+        // If file doesn't exist, start with empty graph
+        if !self.file_path.exists() {
+            info!("No existing graph file found, starting with empty graph");
+            self.graph = Graph::new();
+            self.node_map = HashMap::new();
+            return Ok(());
+        }
+
+        // Load graph from GraphML file
+        let file_path = self.file_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            GraphMlHandler::read_graphml(&file_path)
+        }).await??;
+
+        // Update internal state
+        self.graph = result;
+        
+        // Rebuild node map
+        self.node_map.clear();
+        for node_idx in self.graph.node_indices() {
+            if let Some(node_data) = self.graph.node_weight(node_idx) {
+                self.node_map.insert(node_data.id.clone(), node_idx);
             }
-            
-            let mut edges_vec = Vec::new();
-            for edge in graph.edge_references() {
-                let src = edge.source();
-                let tgt = edge.target();
-                if let (Some(src_data), Some(tgt_data)) = (graph.node_weight(src), graph.node_weight(tgt)) {
-                    edges_vec.push((src_data.id.clone(), tgt_data.id.clone(), edge.weight().clone()));
-                }
-            }
-            
-            let persistence = GraphPersistence {
-                nodes: nodes_vec,
-                edges: edges_vec,
-            };
-            
-            let content = serde_json::to_string_pretty(&persistence)?;
-            fs::write(&file_path, content)?;
-            Ok(())
-        }).await?
+        }
+
+        info!("Successfully loaded graph with {} nodes and {} edges", 
+              self.graph.node_count(), 
+              self.graph.edge_count());
+
+        Ok(())
     }
 
     async fn has_node(&self, node_id: &str) -> bool {
@@ -907,16 +980,13 @@ impl GraphStorage for PetgraphStorage {
             node_map.get(&node_id).map(|&node_idx| {
                 let mut edges = Vec::new();
                 for edge in graph.edges(node_idx) {
-                    if let (Some(src_data), Some(tgt_data)) = (
-                        graph.node_weight(edge.source()),
-                        graph.node_weight(edge.target())
-                    ) {
-                        edges.push((
-                            src_data.id.clone(),
-                            tgt_data.id.clone(),
-                            edge.weight().clone()
-                        ));
-                    }
+                    let src = graph[edge.source()].id.clone();
+                    let tgt = graph[edge.target()].id.clone();
+                    edges.push((
+                        src,
+                        tgt,
+                        edge.weight().clone()
+                    ));
                 }
                 edges
             })
@@ -963,12 +1033,15 @@ impl GraphStorage for PetgraphStorage {
         let mut graph = self.graph.clone();
         let mut node_map = self.node_map.clone();
 
+        tracing::info!("Upserting node {} with {} attributes", node_id, attributes.len());
+
         let result = tokio::task::spawn_blocking(move || {
             if let Some(&node_idx) = node_map.get(&node_id) {
                 if let Some(node_data) = graph.node_weight_mut(node_idx) {
                     for (k, v) in attributes {
                         node_data.attributes.insert(k, v);
                     }
+                    tracing::debug!("Updated existing node {}", node_id);
                 }
             } else {
                 let node_data = NodeData {
@@ -976,12 +1049,12 @@ impl GraphStorage for PetgraphStorage {
                     attributes,
                 };
                 let idx = graph.add_node(node_data);
-                node_map.insert(node_id, idx);
+                node_map.insert(node_id.clone(), idx);
+                tracing::debug!("Created new node {}", node_id);
             }
             (graph, node_map)
         }).await?;
 
-        // Update the storage state with the modified graph and node_map
         self.graph = result.0;
         self.node_map = result.1;
         Ok(())
@@ -992,11 +1065,15 @@ impl GraphStorage for PetgraphStorage {
         let target_id = target_id.to_string();
         let data = data.clone();
         
+        tracing::info!("Upserting edge {} -> {} with weight {}", source_id, target_id, data.weight);
+
         // First ensure nodes exist
         if !<Self as crate::storage::graph::GraphStorage>::has_node(self, &source_id).await {
+            tracing::debug!("Creating missing source node {}", source_id);
             <Self as crate::storage::graph::GraphStorage>::upsert_node(self, &source_id, std::collections::HashMap::new()).await?;
         }
         if !<Self as crate::storage::graph::GraphStorage>::has_node(self, &target_id).await {
+            tracing::debug!("Creating missing target node {}", target_id);
             <Self as crate::storage::graph::GraphStorage>::upsert_node(self, &target_id, std::collections::HashMap::new()).await?;
         }
 
@@ -1015,15 +1092,16 @@ impl GraphStorage for PetgraphStorage {
         let result = tokio::task::spawn_blocking(move || {
             if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
                 if let Some(weight) = graph.edge_weight_mut(edge_idx) {
-                    *weight = data;
+                    *weight = data.clone();
+                    tracing::debug!("Updated existing edge {} -> {}", source_id, target_id);
                 }
             } else {
-                graph.add_edge(src_idx, tgt_idx, data);
+                graph.add_edge(src_idx, tgt_idx, data.clone());
+                tracing::debug!("Created new edge {} -> {}", source_id, target_id);
             }
             graph
         }).await?;
 
-        // Update the storage state with the modified graph
         self.graph = result;
         Ok(())
     }
@@ -1085,12 +1163,12 @@ impl GraphStorage for PetgraphStorage {
         let mut node_map = self.node_map.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            for node_id in node_ids {
+        for node_id in node_ids {
                 if let Some(&idx) = node_map.get(&node_id) {
                     graph.remove_node(idx);
                     node_map.remove(&node_id);
                 }
-            }
+        }
             (graph, node_map)
         }).await?;
 
@@ -1124,4 +1202,10 @@ impl GraphStorage for PetgraphStorage {
             }
         }).await?
     }
+}
+
+// Helper function for Node2Vec embedding
+fn node2vec_handler(graph: &petgraph::graph::Graph<crate::storage::graph::NodeData, crate::storage::graph::EdgeData>) -> Result<(Vec<f32>, Vec<NodeIndex>)> {
+    let config = Node2VecConfig::default();
+    generate_node2vec_embeddings(graph, &config)
 } 

@@ -92,3 +92,6 @@ pub use petgraph_storage::{EdgeData, NodeData, PetgraphStorage};
 /// - Embedding generation utilities
 /// - Graph embedding traits and types
 pub mod embeddings;
+
+/// Module for GraphML format handling.
+pub mod graphml;

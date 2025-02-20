@@ -62,6 +62,7 @@ lightrag-dev/
 gui/
 
 nano-vectordb/
+petgraph-graphml/
 
 # Rust-specific files
 rust/target/

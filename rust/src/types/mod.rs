@@ -34,6 +34,10 @@ pub enum Error {
     /// Invalid input errors
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// XML errors
+    #[error("XML error: {0}")]
+    Xml(#[from] quick_xml::Error),
 }
 
 /// Result type for SuperLightRAG operations

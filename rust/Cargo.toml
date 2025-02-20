@@ -49,6 +49,7 @@ bytemuck = "1.12"
 
 # Graph operations
 petgraph = "0.6"
+quick-xml = { version = "0.31", features = ["serialize"] }
 
 # Node embeddings
 node2vec = "1.0.1"

@@ -96,7 +96,7 @@ mod tests {
         storage.upsert_edge("C", "A", edge_data.clone()).await?;
 
         // Test default embeddings
-        let (embeddings, node_ids) = storage.embed_nodes(EmbeddingAlgorithm::Node2Vec)?;
+        let (embeddings, node_ids) = storage.embed_nodes(EmbeddingAlgorithm::Node2Vec).await?;
         assert_eq!(node_ids.len(), 3);
         assert_eq!(embeddings.len(), 128 * 3); // Default dimension is 128
 

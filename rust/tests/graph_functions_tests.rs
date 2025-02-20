@@ -276,9 +276,9 @@ mod tests {
         assert_eq!(node_ids, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
         
         // Test embedding generation
-        let (embeddings, ids) = storage.embed_nodes(EmbeddingAlgorithm::Node2Vec)?;
-        assert_eq!(ids.len(), 3); // Should have embeddings for all 3 nodes
-        assert_eq!(embeddings.len(), ids.len() * 128); // Default dimension is 128
+        let (embeddings, node_ids) = storage.embed_nodes(EmbeddingAlgorithm::Node2Vec).await?;
+        assert_eq!(node_ids.len(), 3); // Should have embeddings for all 3 nodes
+        assert_eq!(embeddings.len(), node_ids.len() * 128); // Default dimension is 128
         
         storage.finalize().await?;
         Ok(())
