@@ -641,7 +641,7 @@ impl PetgraphStorage {
         let mut node_map = self.node_map.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            for (node_id, attrs) in nodes {
+        for (node_id, attrs) in nodes {
                 if let Some(&node_idx) = node_map.get(&node_id) {
                     if let Some(node_data) = graph.node_weight_mut(node_idx) {
                         for (k, v) in attrs {
@@ -677,7 +677,7 @@ impl PetgraphStorage {
         let node_map = self.node_map.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            for (src, tgt, data) in edges {
+        for (src, tgt, data) in edges {
                 if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&src), node_map.get(&tgt)) {
                     if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
                         if let Some(weight) = graph.edge_weight_mut(edge_idx) {

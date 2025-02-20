@@ -32,7 +32,7 @@ tracing-subscriber = "0.3"
 
 # Utils
 uuid = { version = "1.0", features = ["v4"] }
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 
 # WASM support
 wasm-bindgen = { version = "0.2", optional = true }
@@ -54,6 +54,9 @@ quick-xml = { version = "0.31", features = ["serialize"] }
 # Node embeddings
 node2vec = "1.0.1"
 nalgebra = "0.32"
+
+# Text processing
+tiktoken-rs = "0.5.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
