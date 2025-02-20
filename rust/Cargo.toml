@@ -50,12 +50,14 @@ bytemuck = "1.12"
 # Graph operations
 petgraph = "0.6"
 
-# Added tempfile dependency
-tempfile = "3.8"
+# Node embeddings
+node2vec = "1.0.1"
+nalgebra = "0.32"
 
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
+tempfile = "3.8"
 
 [features]
 default = []

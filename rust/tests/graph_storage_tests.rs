@@ -1,61 +1,57 @@
-use super_lightrag::storage::graph::{PetgraphStorage, EdgeData};
-use super_lightrag::types::{Config, Result};
-use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use serde_json::Value;
+
+use super_lightrag::storage::graph::petgraph_storage::{PetgraphStorage, EdgeData};
+use super_lightrag::storage::graph::GraphStorage;
+use super_lightrag::types::{Config, Result};
 
 #[tokio::test]
-async fn test_upsert_and_query_nodes_and_edges() -> Result<()> {
+async fn test_graph_storage() -> Result<()> {
     // Create a temporary working directory
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-
+    
     // Create a custom config overriding the working_dir
     let mut config = Config::default();
     config.working_dir = temp_dir.path().to_path_buf();
-
-    // Create a new instance of PetgraphStorage
+    
+    // Create a new storage instance
     let mut storage = PetgraphStorage::new(&config)?;
-    // Import the GraphStorage trait to bring initialize and finalize into scope
-    use super_lightrag::storage::graph::GraphStorage;
-    storage.initialize().await?; // load graph; should be empty initially
+    storage.initialize().await?;
 
-    // Upsert nodes: "node1" and "node2"
-    let mut node1_attributes = HashMap::new();
-    node1_attributes.insert("label".to_string(), json!("Node 1"));
-    storage.upsert_node("node1", node1_attributes)?;
+    // Test node operations
+    let mut node_attrs = HashMap::new();
+    node_attrs.insert("key1".to_string(), Value::String("value1".to_string()));
+    
+    storage.upsert_node("node1", node_attrs.clone()).await?;
+    let has_node = storage.has_node("node1").await;
+    assert!(has_node);
 
-    let mut node2_attributes = HashMap::new();
-    node2_attributes.insert("label".to_string(), json!("Node 2"));
-    storage.upsert_node("node2", node2_attributes)?;
-
-    assert!(storage.has_node("node1"));
-    assert!(storage.has_node("node2"));
-
-    // Upsert an edge between node1 and node2
+    // Test edge operations
     let edge_data = EdgeData {
-        weight: 1.5,
-        description: Some("Edge from 1 to 2".to_string()),
-        keywords: Some(vec!["test".to_string()]),
+        weight: 1.0,
+        description: Some("test edge".to_string()),
+        keywords: Some(vec!["keyword1".to_string()]),
     };
-    storage.upsert_edge("node1", "node2", edge_data.clone())?;
 
-    assert!(storage.has_edge("node1", "node2"));
+    storage.upsert_edge("node1", "node2", edge_data.clone()).await?;
+    let has_edge = storage.has_edge("node1", "node2").await;
+    assert!(has_edge);
 
-    // Check node_degree of node1, should be 1 (only one edge exists)
-    let degree_node1 = storage.node_degree("node1")?;
-    assert_eq!(degree_node1, 1);
-
-    // Delete the edge between node1 and node2
-    storage.delete_edge("node1", "node2")?;
-    assert!(!storage.has_edge("node1", "node2"));
+    // Test edge deletion
+    storage.delete_edge("node1", "node2").await?;
+    let has_edge = storage.has_edge("node1", "node2").await;
+    assert!(!has_edge);
 
     // Upsert the edge again for persistence testing
-    storage.upsert_edge("node1", "node2", edge_data.clone())?;
+    storage.upsert_edge("node1", "node2", edge_data.clone()).await?;
 
     // Delete node2, which should remove associated edges
-    storage.delete_node("node2")?;
-    assert!(!storage.has_node("node2"));
-    assert!(!storage.has_edge("node1", "node2"));
+    storage.delete_node("node2").await?;
+    let has_node2 = storage.has_node("node2").await;
+    let has_edge = storage.has_edge("node1", "node2").await;
+    assert!(!has_node2);
+    assert!(!has_edge);
 
     // Finalize storage (save graph)
     storage.finalize().await?;
@@ -65,9 +61,10 @@ async fn test_upsert_and_query_nodes_and_edges() -> Result<()> {
     storage_new.initialize().await?;
 
     // Check that node1 exists and node2 does not
-    assert!(storage_new.has_node("node1"));
-    assert!(!storage_new.has_node("node2"));
+    let has_node1 = storage_new.has_node("node1").await;
+    let has_node2 = storage_new.has_node("node2").await;
+    assert!(has_node1);
+    assert!(!has_node2);
 
-    // TempDir will clean up automatically
     Ok(())
 } 

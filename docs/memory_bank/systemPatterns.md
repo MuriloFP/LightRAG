@@ -18,6 +18,45 @@
    - Efficient relationship mapping
    - Memory-optimized graph traversal
    - Native Rust implementation
+   - Strongly typed data structures:
+     - `NodeData`: ID and attribute map
+     - `EdgeData`: Weight, description, keywords
+   - JSON-based persistence
+   - Advanced features:
+     - Pattern matching
+     - A* pathfinding
+     - Graph algorithm support
+   - Node embedding support:
+     - Basic vector embedding
+     - Node2Vec integration (planned)
+   - Graph operations:
+     - CRUD operations
+     - Batch operations
+     - Cascading deletes
+     - Graph stabilization
+     - Default edge properties
+   - Performance optimizations:
+     - Memory-efficient storage
+     - Optimized query paths
+     - Batch operation support
+
+4. **Storage Pattern Comparison with LightRAG**
+   - LightRAG supports multiple backends:
+     - NetworkX (in-memory)
+     - Gremlin (TinkerPop)
+     - PostgreSQL (AGE)
+     - MongoDB
+     - TiDB
+     - Oracle
+   - SuperLightRAG focuses on single efficient implementation:
+     - Petgraph for performance
+     - Memory optimization
+     - Native Rust benefits
+   - Key differences:
+     - Strong typing vs dynamic typing
+     - Single vs multiple backends
+     - File-based vs varied persistence
+     - Enhanced graph algorithms
 
 ### Core Processing Pipeline
 1. Document Processing

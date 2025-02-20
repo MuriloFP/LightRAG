@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::types::{Result, Config};
+use crate::types::{Result, Config, Error};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
@@ -9,6 +9,9 @@ use petgraph::Direction;
 use petgraph::visit::EdgeRef;
 use petgraph::algo::astar;
 use std::collections::{HashSet, VecDeque};
+use super::embeddings::{EmbeddingAlgorithm, Node2VecConfig, generate_node2vec_embeddings};
+use crate::storage::graph::GraphStorage;
+use tokio::task::JoinError;
 
 /// Data structure representing a node in the graph with its attributes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -63,6 +66,12 @@ pub struct GraphPattern {
 pub struct PatternMatch {
     /// List of node IDs that match the pattern criteria.
     pub node_ids: Vec<String>,
+}
+
+impl From<JoinError> for crate::types::Error {
+    fn from(err: JoinError) -> Self {
+        crate::types::Error::Storage(format!("Task join error: {}", err))
+    }
 }
 
 impl PetgraphStorage {
@@ -141,7 +150,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn upsert_node(&mut self, node_id: &str, attributes: HashMap<String, serde_json::Value>) -> Result<()> {
+    pub async fn upsert_node_impl(&mut self, node_id: &str, attributes: HashMap<String, serde_json::Value>) -> Result<()> {
         if let Some(&node_idx) = self.node_map.get(node_id) {
             if let Some(node_data) = self.graph.node_weight_mut(node_idx) {
                 for (k, v) in attributes {
@@ -168,19 +177,18 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn upsert_edge(&mut self, source_id: &str, target_id: &str, data: EdgeData) -> Result<()> {
-        // Ensure both nodes exist
-        if !self.node_map.contains_key(source_id) {
-            self.upsert_node(source_id, HashMap::new())?;
+    pub async fn upsert_edge_impl(&mut self, source_id: &str, target_id: &str, data: EdgeData) -> Result<()> {
+        if !self.has_node_impl(source_id).await {
+            self.upsert_node_impl(source_id, HashMap::new()).await?;
         }
-        if !self.node_map.contains_key(target_id) {
-            self.upsert_node(target_id, HashMap::new())?;
+        if !self.has_node_impl(target_id).await {
+            self.upsert_node_impl(target_id, HashMap::new()).await?;
         }
         let src_idx = *self.node_map.get(source_id).unwrap();
         let tgt_idx = *self.node_map.get(target_id).unwrap();
         if let Some(edge_idx) = self.graph.find_edge(src_idx, tgt_idx) {
             if let Some(weight) = self.graph.edge_weight_mut(edge_idx) {
-                *weight = data.clone();
+                *weight = data;
             }
         } else {
             self.graph.add_edge(src_idx, tgt_idx, data);
@@ -195,7 +203,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn delete_node(&mut self, node_id: &str) -> Result<()> {
+    pub async fn delete_node_impl(&mut self, node_id: &str) -> Result<()> {
         if let Some(&node_idx) = self.node_map.get(node_id) {
             self.graph.remove_node(node_idx);
             self.node_map.remove(node_id);
@@ -211,12 +219,23 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn delete_edge(&mut self, source_id: &str, target_id: &str) -> Result<()> {
-        if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
-            if let Some(edge_idx) = self.graph.find_edge(src_idx, tgt_idx) {
-                self.graph.remove_edge(edge_idx);
+    pub async fn delete_edge_impl(&mut self, source_id: &str, target_id: &str) -> Result<()> {
+        let source_id = source_id.to_string();
+        let target_id = target_id.to_string();
+        let node_map = self.node_map.clone();
+        let mut graph = self.graph.clone();
+        
+        let result = tokio::task::spawn_blocking(move || {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
+                if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
+                    graph.remove_edge(edge_idx);
+                }
             }
-        }
+            graph
+        }).await?;
+
+        // Update the storage state with the modified graph
+        self.graph = result;
         Ok(())
     }
 
@@ -227,7 +246,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// true if the node exists, false otherwise
-    pub fn has_node(&self, node_id: &str) -> bool {
+    pub async fn has_node_impl(&self, node_id: &str) -> bool {
         self.node_map.contains_key(node_id)
     }
 
@@ -239,12 +258,18 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// true if the edge exists, false otherwise
-    pub fn has_edge(&self, source_id: &str, target_id: &str) -> bool {
-        if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
-            self.graph.find_edge(src_idx, tgt_idx).is_some()
-        } else {
-            false
-        }
+    pub async fn has_edge_impl(&self, source_id: &str, target_id: &str) -> bool {
+        let source_id = source_id.to_string();
+        let target_id = target_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
+                graph.find_edge(src_idx, tgt_idx).is_some()
+            } else {
+                false
+            }
+        }).await.unwrap_or(false)
     }
 
     /// Calculates the total degree (in + out) of a node.
@@ -394,17 +419,6 @@ impl PetgraphStorage {
         Ok(matches)
     }
 
-    /// Retrieves the data associated with a specific node.
-    /// 
-    /// # Arguments
-    /// * `node_id` - ID of the node to retrieve
-    /// 
-    /// # Returns
-    /// Option containing the NodeData if the node exists, None otherwise
-    pub fn get_node(&self, node_id: &str) -> Option<NodeData> {
-        self.node_map.get(node_id).and_then(|&idx| self.graph.node_weight(idx).cloned())
-    }
-
     /// Retrieves the data associated with an edge between two nodes.
     /// 
     /// # Arguments
@@ -533,9 +547,9 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn upsert_nodes(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> crate::types::Result<()> {
+    pub async fn upsert_nodes_impl(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> crate::types::Result<()> {
         for (node_id, attrs) in nodes {
-            self.upsert_node(&node_id, attrs)?;
+            self.upsert_node_impl(&node_id, attrs).await?;
         }
         Ok(())
     }
@@ -547,9 +561,9 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn upsert_edges(&mut self, edges: Vec<(String, String, EdgeData)>) -> crate::types::Result<()> {
+    pub async fn upsert_edges_impl(&mut self, edges: Vec<(String, String, EdgeData)>) -> crate::types::Result<()> {
         for (src, tgt, data) in edges {
-            self.upsert_edge(&src, &tgt, data)?;
+            self.upsert_edge_impl(&src, &tgt, data).await?;
         }
         Ok(())
     }
@@ -561,10 +575,22 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn delete_nodes_batch(&mut self, node_ids: Vec<String>) -> crate::types::Result<()> {
-        for node_id in node_ids {
-            self.delete_node(&node_id)?;
-        }
+    pub async fn remove_nodes_impl(&mut self, node_ids: Vec<String>) -> crate::types::Result<()> {
+        let mut graph = self.graph.clone();
+        let mut node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for node_id in node_ids {
+                if let Some(&idx) = node_map.get(&node_id) {
+                    graph.remove_node(idx);
+                    node_map.remove(&node_id);
+                }
+            }
+            (graph, node_map)
+        }).await?;
+
+        self.graph = result.0;
+        self.node_map = result.1;
         Ok(())
     }
 
@@ -575,9 +601,9 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn delete_edges_batch(&mut self, edges: Vec<(String, String)>) -> crate::types::Result<()> {
+    pub async fn remove_edges_impl(&mut self, edges: Vec<(String, String)>) -> crate::types::Result<()> {
         for (src, tgt) in edges {
-            self.delete_edge(&src, &tgt)?;
+            self.delete_edge_impl(&src, &tgt).await?;
         }
         Ok(())
     }
@@ -589,22 +615,27 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub fn cascading_delete_node(&mut self, node_id: &str) -> crate::types::Result<()> {
-        // Delete the node (incident edges are removed automatically by remove_node)
-        self.delete_node(node_id)?;
-        
-        // For every remaining node, if the "source_id" attribute equals the deleted node_id, remove it.
-        for idx in self.graph.node_indices() {
-            if let Some(node_data) = self.graph.node_weight_mut(idx) {
-                if let Some(value) = node_data.attributes.get_mut("source_id") {
-                    if let Some(str_val) = value.as_str() {
-                        if str_val == node_id {
+    pub async fn cascading_delete_node(&mut self, node_id: &str) -> Result<()> {
+        // First, delete the target node normally
+        self.delete_node_impl(node_id).await?;
+
+        let node_id_str = node_id.to_string();
+        let mut graph = self.graph.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for node_idx in graph.node_indices() {
+                if let Some(node_data) = graph.node_weight_mut(node_idx) {
+                    if let Some(val) = node_data.attributes.get("source_id") {
+                        if *val == serde_json::Value::String(node_id_str.clone()) {
                             node_data.attributes.remove("source_id");
                         }
                     }
                 }
             }
-        }
+            graph
+        }).await?;
+
+        self.graph = result;
         Ok(())
     }
 
@@ -667,8 +698,9 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// EdgeData for the edge if it exists, or default edge properties
-    pub fn get_edge_with_default(&self, source_id: &str, target_id: &str) -> EdgeData {
-        self.get_edge(source_id, target_id)
+    pub async fn get_edge_with_default(&self, source_id: &str, target_id: &str) -> EdgeData {
+        <Self as GraphStorage>::get_edge(self, source_id, target_id)
+            .await
             .unwrap_or_else(|| Self::default_edge_properties())
     }
 
@@ -720,48 +752,376 @@ impl PetgraphStorage {
         Ok(())
     }
 
-    /// Generates simple embeddings for nodes using a basic node2vec-like approach.
-    /// 
-    /// # Arguments
-    /// * `dimension` - Dimensionality of the embeddings to generate
-    /// 
-    /// # Returns
-    /// A Result containing a tuple of (embeddings vector, node IDs vector)
-    pub async fn embed_nodes(&self, dimension: usize) -> crate::types::Result<(Vec<f32>, Vec<String>)> {
-        // Collect node ids and sort them for consistency
-        let mut node_ids: Vec<String> = self.graph.node_weights().map(|node| node.id.clone()).collect();
-        node_ids.sort();
-        
-        let mut embeddings = Vec::new();
-        // For each node, compute a dummy embedding vector
-        for node_id in &node_ids {
-            // Simple hash: sum of byte values mod 100 scaled to [0,1]
-            let sum: u32 = node_id.bytes().map(|b| b as u32).sum();
-            let val = (sum % 100) as f32 / 100.0;
-            let emb = vec![val; dimension];
-            embeddings.extend(emb);
+    /// Generate embeddings for all nodes in the graph using the specified algorithm
+    pub fn embed_nodes(&self, algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>)> {
+        match algorithm {
+            EmbeddingAlgorithm::Node2Vec => {
+                let config = Node2VecConfig::default();
+                let (embeddings, indices) = generate_node2vec_embeddings(&self.graph, &config)?;
+                
+                // Convert node indices to node IDs
+                let node_ids = indices.into_iter()
+                    .filter_map(|idx| self.graph.node_weight(idx).map(|node| node.id.clone()))
+                    .collect();
+                
+                Ok((embeddings, node_ids))
+            }
         }
-        Ok((embeddings, node_ids))
+    }
+
+    /// Generate embeddings with custom configuration
+    pub fn embed_nodes_with_config(
+        &self,
+        algorithm: EmbeddingAlgorithm,
+        config: Node2VecConfig,
+    ) -> Result<(Vec<f32>, Vec<String>)> {
+        match algorithm {
+            EmbeddingAlgorithm::Node2Vec => {
+                let (embeddings, indices) = generate_node2vec_embeddings(&self.graph, &config)?;
+                
+                // Convert node indices to node IDs
+                let node_ids = indices.into_iter()
+                    .filter_map(|idx| self.graph.node_weight(idx).map(|node| node.id.clone()))
+                    .collect();
+                
+                Ok((embeddings, node_ids))
+            }
+        }
     }
 }
 
 #[async_trait]
-impl crate::storage::graph::GraphStorage for PetgraphStorage {
-    /// Initializes the graph storage by loading data from disk.
-    /// 
-    /// # Returns
-    /// A Result indicating success or failure of initialization
+impl GraphStorage for PetgraphStorage {
     async fn initialize(&mut self) -> Result<()> {
-        self.load_graph()?;
+        let file_path = self.file_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if file_path.exists() {
+                let content = fs::read_to_string(&file_path)?;
+                let persistence: GraphPersistence = serde_json::from_str(&content)?;
+                let mut graph = Graph::<NodeData, EdgeData>::new();
+                let mut node_map = HashMap::new();
+                
+                // Add nodes
+                for (id, node_data) in persistence.nodes {
+                    let idx = graph.add_node(node_data.clone());
+                    node_map.insert(id.clone(), idx);
+                }
+                
+                // Add edges
+                for (src_id, tgt_id, edge_data) in persistence.edges {
+                    if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&src_id), node_map.get(&tgt_id)) {
+                        graph.add_edge(src_idx, tgt_idx, edge_data);
+                    }
+                }
+                
+                Ok((graph, node_map))
+            } else {
+                Ok((Graph::<NodeData, EdgeData>::new(), HashMap::new()))
+            }
+        }).await?;
+        
+        match result {
+            Ok((graph, node_map)) => {
+                self.graph = graph;
+                self.node_map = node_map;
+                Ok(())
+            }
+            Err(e) => Err(e)
+        }
+    }
+
+    async fn finalize(&mut self) -> Result<()> {
+        let graph = self.graph.clone();
+        let node_map = self.node_map.clone();
+        let file_path = self.file_path.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let mut nodes_vec = Vec::new();
+            for (id, &node_idx) in &node_map {
+                if let Some(node_data) = graph.node_weight(node_idx) {
+                    nodes_vec.push((id.clone(), node_data.clone()));
+                }
+            }
+            
+            let mut edges_vec = Vec::new();
+            for edge in graph.edge_references() {
+                let src = edge.source();
+                let tgt = edge.target();
+                if let (Some(src_data), Some(tgt_data)) = (graph.node_weight(src), graph.node_weight(tgt)) {
+                    edges_vec.push((src_data.id.clone(), tgt_data.id.clone(), edge.weight().clone()));
+                }
+            }
+            
+            let persistence = GraphPersistence {
+                nodes: nodes_vec,
+                edges: edges_vec,
+            };
+            
+            let content = serde_json::to_string_pretty(&persistence)?;
+            fs::write(&file_path, content)?;
+            Ok(())
+        }).await?
+    }
+
+    async fn has_node(&self, node_id: &str) -> bool {
+        let node_id = node_id.to_string();
+        let node_map = self.node_map.clone();
+        tokio::task::spawn_blocking(move || {
+            node_map.contains_key(&node_id)
+        }).await.unwrap_or(false)
+    }
+
+    async fn has_edge(&self, source_id: &str, target_id: &str) -> bool {
+        self.has_edge_impl(source_id, target_id).await
+    }
+
+    async fn get_node(&self, node_id: &str) -> Option<NodeData> {
+        let node_id = node_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            node_map.get(&node_id).and_then(|&idx| graph.node_weight(idx).cloned())
+        }).await.unwrap_or(None)
+    }
+
+    async fn get_edge(&self, source_id: &str, target_id: &str) -> Option<EdgeData> {
+        let source_id = source_id.to_string();
+        let target_id = target_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
+                graph.find_edge(src_idx, tgt_idx)
+                    .and_then(|edge_idx| graph.edge_weight(edge_idx).cloned())
+            } else {
+                None
+            }
+        }).await.unwrap_or(None)
+    }
+
+    async fn get_node_edges(&self, node_id: &str) -> Option<Vec<(String, String, EdgeData)>> {
+        let node_id = node_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            node_map.get(&node_id).map(|&node_idx| {
+                let mut edges = Vec::new();
+                for edge in graph.edges(node_idx) {
+                    if let (Some(src_data), Some(tgt_data)) = (
+                        graph.node_weight(edge.source()),
+                        graph.node_weight(edge.target())
+                    ) {
+                        edges.push((
+                            src_data.id.clone(),
+                            tgt_data.id.clone(),
+                            edge.weight().clone()
+                        ));
+                    }
+                }
+                edges
+            })
+        }).await.unwrap_or(None)
+    }
+
+    async fn node_degree(&self, node_id: &str) -> Result<usize> {
+        let node_id = node_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(&idx) = node_map.get(&node_id) {
+                let out_deg = graph.edges_directed(idx, Direction::Outgoing).count();
+                let in_deg = graph.edges_directed(idx, Direction::Incoming).count();
+                Ok(out_deg + in_deg)
+            } else {
+                Ok(0)
+            }
+        }).await?
+    }
+
+    async fn edge_degree(&self, src_id: &str, tgt_id: &str) -> Result<usize> {
+        let src_id = src_id.to_string();
+        let tgt_id = tgt_id.to_string();
+        let node_map = self.node_map.clone();
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut total = 0;
+            if let Some(&src_idx) = node_map.get(&src_id) {
+                total += graph.edges_directed(src_idx, Direction::Outgoing).count();
+                total += graph.edges_directed(src_idx, Direction::Incoming).count();
+            }
+            if let Some(&tgt_idx) = node_map.get(&tgt_id) {
+                total += graph.edges_directed(tgt_idx, Direction::Outgoing).count();
+                total += graph.edges_directed(tgt_idx, Direction::Incoming).count();
+            }
+            Ok(total)
+        }).await?
+    }
+
+    async fn upsert_node(&mut self, node_id: &str, attributes: HashMap<String, serde_json::Value>) -> Result<()> {
+        let node_id = node_id.to_string();
+        let attributes = attributes.clone();
+        let mut graph = self.graph.clone();
+        let mut node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(&node_idx) = node_map.get(&node_id) {
+                if let Some(node_data) = graph.node_weight_mut(node_idx) {
+                    for (k, v) in attributes {
+                        node_data.attributes.insert(k, v);
+                    }
+                }
+            } else {
+                let node_data = NodeData {
+                    id: node_id.clone(),
+                    attributes,
+                };
+                let idx = graph.add_node(node_data);
+                node_map.insert(node_id, idx);
+            }
+            (graph, node_map)
+        }).await?;
+
+        // Update the storage state with the modified graph and node_map
+        self.graph = result.0;
+        self.node_map = result.1;
         Ok(())
     }
 
-    /// Finalizes the graph storage by saving data to disk.
-    /// 
-    /// # Returns
-    /// A Result indicating success or failure of finalization
-    async fn finalize(&mut self) -> Result<()> {
-        self.save_graph()?;
+    async fn upsert_edge(&mut self, source_id: &str, target_id: &str, data: EdgeData) -> Result<()> {
+        let source_id = source_id.to_string();
+        let target_id = target_id.to_string();
+        let data = data.clone();
+        
+        // First ensure nodes exist
+        if !<Self as crate::storage::graph::GraphStorage>::has_node(self, &source_id).await {
+            <Self as crate::storage::graph::GraphStorage>::upsert_node(self, &source_id, std::collections::HashMap::new()).await?;
+        }
+        if !<Self as crate::storage::graph::GraphStorage>::has_node(self, &target_id).await {
+            <Self as crate::storage::graph::GraphStorage>::upsert_node(self, &target_id, std::collections::HashMap::new()).await?;
+        }
+
+        // Get the indices after ensuring nodes exist
+        let src_idx = match self.node_map.get(&source_id) {
+            Some(&idx) => idx,
+            None => return Err(Error::Storage(format!("Source node {} not found", source_id))),
+        };
+        let tgt_idx = match self.node_map.get(&target_id) {
+            Some(&idx) => idx,
+            None => return Err(Error::Storage(format!("Target node {} not found", target_id))),
+        };
+
+        let mut graph = self.graph.clone();
+        
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
+                if let Some(weight) = graph.edge_weight_mut(edge_idx) {
+                    *weight = data;
+                }
+            } else {
+                graph.add_edge(src_idx, tgt_idx, data);
+            }
+            graph
+        }).await?;
+
+        // Update the storage state with the modified graph
+        self.graph = result;
         Ok(())
+    }
+
+    async fn delete_node(&mut self, node_id: &str) -> Result<()> {
+        let node_id_str = node_id.to_string();
+        let mut graph = self.graph.clone();
+        let mut node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(&node_idx) = node_map.get(&node_id_str) {
+                graph.remove_node(node_idx);
+                node_map.remove(&node_id_str);
+            }
+            (graph, node_map)
+        }).await?;
+
+        self.graph = result.0;
+        self.node_map = result.1;
+        Ok(())
+    }
+
+    async fn delete_edge(&mut self, source_id: &str, target_id: &str) -> Result<()> {
+        let source_id = source_id.to_string();
+        let target_id = target_id.to_string();
+        let node_map = self.node_map.clone();
+        let mut graph = self.graph.clone();
+        
+        let result = tokio::task::spawn_blocking(move || {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
+                if let Some(edge_idx) = graph.find_edge(src_idx, tgt_idx) {
+                    graph.remove_edge(edge_idx);
+                }
+            }
+            graph
+        }).await?;
+
+        // Update the storage state with the modified graph
+        self.graph = result;
+        Ok(())
+    }
+
+    async fn upsert_nodes(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> Result<()> {
+        for (node_id, attrs) in nodes {
+            <Self as crate::storage::graph::GraphStorage>::upsert_node(self, &node_id, attrs).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_edges(&mut self, edges: Vec<(String, String, EdgeData)>) -> Result<()> {
+        for (src, tgt, data) in edges {
+            self.upsert_edge(&src, &tgt, data).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_nodes(&mut self, node_ids: Vec<String>) -> Result<()> {
+        let mut graph = self.graph.clone();
+        let mut node_map = self.node_map.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for node_id in node_ids {
+                if let Some(&idx) = node_map.get(&node_id) {
+                    graph.remove_node(idx);
+                    node_map.remove(&node_id);
+                }
+            }
+            (graph, node_map)
+        }).await?;
+
+        self.graph = result.0;
+        self.node_map = result.1;
+        Ok(())
+    }
+
+    async fn remove_edges(&mut self, edges: Vec<(String, String)>) -> Result<()> {
+        for (src, tgt) in edges {
+            self.delete_edge_impl(&src, &tgt).await?;
+        }
+        Ok(())
+    }
+
+    async fn embed_nodes(&self, algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>)> {
+        let graph = self.graph.clone();
+        tokio::task::spawn_blocking(move || {
+            match algorithm {
+                EmbeddingAlgorithm::Node2Vec => {
+                    let config = Node2VecConfig::default();
+                    let (embeddings, indices) = generate_node2vec_embeddings(&graph, &config)?;
+                    
+                    // Convert node indices to node IDs
+                    let node_ids = indices.into_iter()
+                        .filter_map(|idx| graph.node_weight(idx).map(|node| node.id.clone()))
+                        .collect();
+                    
+                    Ok((embeddings, node_ids))
+                }
+            }
+        }).await?
     }
 } 

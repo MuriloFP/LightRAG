@@ -30,6 +30,10 @@ pub enum Error {
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Invalid input errors
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// Result type for SuperLightRAG operations
