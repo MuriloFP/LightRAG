@@ -60,3 +60,22 @@ dickens/
 book.txt
 lightrag-dev/
 gui/
+
+nano-vectordb/
+
+# Rust-specific files
+rust/target/
+rust/Cargo.lock
+rust/**/*.rs.bk
+rust/debug/
+rust/release/
+rust/profiling/
+rust/.cargo/
+rust/benches/target/
+rust/examples/target/
+rust/tests/target/
+rust/wasm-pack-*/
+rust/pkg/
+rust/target-wasm32/
+rust/target-android/
+rust/target-ios/
