@@ -44,16 +44,18 @@ async-trait = "0.1"
 ndarray = "0.15"
 rand = "0.8"
 base64 = "0.21"
-md5 = "0.7.0"
+md5 = "0.7"
 bytemuck = "1.12"
 
 # Graph operations
 petgraph = "0.6"
 
+# Added tempfile dependency
+tempfile = "3.8"
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
-tempfile = "3.8"
 
 [features]
 default = []

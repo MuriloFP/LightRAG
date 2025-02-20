@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use std::fs;
-use crate::types::Result;
+use crate::types::{Result, Error};
 
 /// A node in the HNSW index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,20 +14,25 @@ pub struct HNSWNode {
     /// The vector representation of the node.
     pub vector: Vec<f32>,
     /// Connections represented as: layer -> Vec<node indices>
+    #[serde(default)]
     pub connections: HashMap<usize, Vec<usize>>,
     /// The maximum layer this node appears in
+    #[serde(default)]
     pub max_layer: usize,
 }
 
 impl HNSWNode {
     /// Creates a new HNSW node with the given id and vector.
     pub fn new(id: &str, vector: Vec<f32>) -> Self {
-        HNSWNode {
+        let mut node = HNSWNode {
             id: id.to_string(),
             vector,
             connections: HashMap::new(),
             max_layer: 0,
-        }
+        };
+        // Initialize connections for layer 0
+        node.connections.insert(0, Vec::new());
+        node
     }
 }
 
@@ -59,7 +64,7 @@ impl Ord for Candidate {
 }
 
 /// HNSW Index structure for approximate nearest neighbor search.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct HNSWIndex {
     /// The collection of nodes in the index.
     pub nodes: Vec<HNSWNode>,
@@ -78,8 +83,21 @@ pub struct HNSWIndex {
     /// Number of updates since last sync
     updates_since_sync: usize,
     /// File path for persistence
-    #[serde(skip)]
     file_path: Option<PathBuf>,
+    /// Vector dimension
+    dimension: Option<usize>,
+}
+
+/// Serialization format for HNSW index
+#[derive(Serialize, Deserialize)]
+struct HNSWIndexSerialized {
+    nodes: Vec<HNSWNode>,
+    entry_point: Option<usize>,
+    max_layers: usize,
+    ef_construction: usize,
+    m: usize,
+    batch_size: usize,
+    sync_threshold: usize,
 }
 
 impl HNSWIndex {
@@ -95,6 +113,7 @@ impl HNSWIndex {
             sync_threshold: 1000,
             updates_since_sync: 0,
             file_path: None,
+            dimension: None,
         }
     }
 
@@ -109,9 +128,9 @@ impl HNSWIndex {
             if path.exists() {
                 let content = fs::read_to_string(path)?;
                 if !content.trim().is_empty() {
-                    let loaded: HNSWIndex = serde_json::from_str(&content)?;
-                    self.nodes = loaded.nodes;
-                    self.entry_point = loaded.entry_point;
+                    let loaded: Vec<HNSWNode> = serde_json::from_str(&content)?;
+                    self.nodes = loaded;
+                    self.entry_point = if self.nodes.is_empty() { None } else { Some(0) };
                     self.updates_since_sync = 0;
                 }
             }
@@ -126,25 +145,43 @@ impl HNSWIndex {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let content = serde_json::to_string_pretty(self)?;
+            let content = serde_json::to_string_pretty(&self.nodes)?;
             fs::write(path, content)?;
         }
         Ok(())
     }
 
     /// Adds a new node to the HNSW index and returns its index.
-    pub fn add_node(&mut self, mut node: HNSWNode) -> usize {
+    pub fn add_node(&mut self, mut node: HNSWNode) -> Result<usize> {
+        // Validate vector dimension
+        let vec_dim = node.vector.len();
+        if let Some(dim) = self.dimension {
+            if vec_dim != dim {
+                return Err(Error::VectorStorage(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    dim, vec_dim
+                )));
+            }
+        } else {
+            self.dimension = Some(vec_dim);
+        }
+
         let idx = self.nodes.len();
         
         // Assign a random maximum layer level
         let mut rng = rand::thread_rng();
         node.max_layer = self.get_random_level(&mut rng);
 
+        // Initialize connections for each layer
+        for level in 0..=node.max_layer {
+            node.connections.insert(level, Vec::new());
+        }
+
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
             self.entry_point = Some(idx);
             self.nodes.push(node);
-            return idx;
+            return Ok(idx);
         }
 
         // Connect the new node to existing nodes
@@ -206,7 +243,7 @@ impl HNSWIndex {
             self.sync();
         }
 
-        idx
+        Ok(idx)
     }
 
     /// Computes the cosine similarity between two vectors.
@@ -222,7 +259,17 @@ impl HNSWIndex {
     }
 
     /// Queries the HNSW index with the given query vector.
-    pub fn query(&self, query: &[f32], top_k: usize, search_ef: usize) -> Vec<(String, f32)> {
+    pub fn query(&self, query: &[f32], top_k: usize, search_ef: usize) -> Result<Vec<(String, f32)>> {
+        // Validate query dimension
+        if let Some(dim) = self.dimension {
+            if query.len() != dim {
+                return Err(Error::VectorStorage(format!(
+                    "Query dimension mismatch: expected {}, got {}",
+                    dim, query.len()
+                )));
+            }
+        }
+
         if let Some(ep) = self.entry_point {
             let mut curr_ep = ep;
             let mut curr_layer = self.nodes[ep].max_layer;
@@ -236,17 +283,15 @@ impl HNSWIndex {
                 curr_layer -= 1;
             }
 
-            // Search the bottom layer with higher ef
-            let candidates = self.search_layer(query, curr_ep, 0, search_ef);
+            // For the bottom layer, use search_ef to control exploration
+            let candidates = self.search_layer(query, curr_ep, 0, search_ef.max(top_k));
             
-            // Convert candidates to results
-            let mut results: Vec<(String, f32)> = candidates.into_iter()
+            // Map candidates to (id, distance) pairs
+            Ok(candidates.into_iter()
                 .map(|c| (self.nodes[c.node_idx].id.clone(), c.distance))
-                .collect();
-            results.truncate(top_k);
-            results
+                .collect())
         } else {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
@@ -263,6 +308,10 @@ impl HNSWIndex {
 
         while let Some(current) = candidates.pop() {
             let worst_dist = results.peek().map_or(f32::NEG_INFINITY, |r| r.distance);
+            if current.distance < worst_dist && results.len() >= ef {
+                break;
+            }
+
             if let Some(node) = self.nodes.get(current.node_idx) {
                 if let Some(neighbors) = node.connections.get(&level) {
                     for &neighbor_idx in neighbors {
@@ -283,54 +332,105 @@ impl HNSWIndex {
             }
         }
 
+        // If we haven't found enough candidates, explore more nodes
+        if results.len() < ef {
+            for (idx, node) in self.nodes.iter().enumerate() {
+                if !visited.contains(&idx) {
+                    let d = Self::cosine_similarity(query, &node.vector);
+                    let candidate = Candidate { node_idx: idx, distance: d };
+                    results.push(candidate);
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+
         results.into_sorted_vec()
     }
 
     /// Deletes nodes from the HNSW index whose ids are in the provided list.
     pub fn delete_nodes(&mut self, delete_ids: &[String]) {
         let id_set: std::collections::HashSet<_> = delete_ids.iter().collect();
+        let mut indices_to_delete = Vec::new();
 
-        // Iterate in reverse order to safely remove nodes
-        for i in (0..self.nodes.len()).rev() {
-            if id_set.contains(&self.nodes[i].id) {
-                // Remove connections to this node from other nodes
-                let idx = i;
-                for node in self.nodes.iter_mut() {
-                    for connections in node.connections.values_mut() {
-                        connections.retain(|&x| x != idx);
-                    }
-                }
+        // First, collect indices of nodes to delete
+        for (i, node) in self.nodes.iter().enumerate() {
+            if id_set.contains(&node.id) {
+                indices_to_delete.push(i);
+            }
+        }
 
-                // Remove the node
-                self.nodes.remove(i);
+        // Sort in reverse order to safely remove nodes
+        indices_to_delete.sort_unstable_by(|a, b| b.cmp(a));
 
-                // Update indices in all connections for nodes with higher index
-                for node in self.nodes.iter_mut() {
-                    for connections in node.connections.values_mut() {
-                        for conn_idx in connections.iter_mut() {
-                            if *conn_idx > i {
-                                *conn_idx -= 1;
-                            }
+        // Remove nodes and update connections
+        for &idx in &indices_to_delete {
+            // Remove the node
+            self.nodes.remove(idx);
+
+            // Update indices in all connections
+            for node in self.nodes.iter_mut() {
+                for connections in node.connections.values_mut() {
+                    // Remove connections to deleted node
+                    connections.retain(|&x| x != idx);
+                    // Update indices for nodes after the deleted one
+                    for conn_idx in connections.iter_mut() {
+                        if *conn_idx > idx {
+                            *conn_idx -= 1;
                         }
                     }
                 }
             }
         }
 
-        // Update entry point
+        // If we have no nodes left, clear entry point
         if self.nodes.is_empty() {
             self.entry_point = None;
-        } else if let Some(ep) = self.entry_point {
-            if ep >= self.nodes.len() {
-                self.entry_point = Some(0);
-            }
+            return;
         }
 
-        // Prune any connection indices that are now out of bounds
-        let current_len = self.nodes.len();
-        for node in self.nodes.iter_mut() {
-            for connections in node.connections.values_mut() {
-                connections.retain(|&conn| conn < current_len);
+        // Find new entry point (node with highest layer)
+        let mut max_layer = 0;
+        let mut max_layer_idx = 0;
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.max_layer > max_layer {
+                max_layer = node.max_layer;
+                max_layer_idx = idx;
+            }
+        }
+        self.entry_point = Some(max_layer_idx);
+
+        // Rebuild connections for affected nodes
+        for layer in (0..=max_layer).rev() {
+            // First, collect all nodes at this layer and their vectors
+            let layer_nodes: Vec<_> = self.nodes.iter().enumerate()
+                .filter(|(_, node)| node.max_layer >= layer)
+                .map(|(i, node)| (i, node.vector.clone()))
+                .collect();
+
+            // For each node at this layer
+            for &(i, ref vec_i) in &layer_nodes {
+                // Find nearest neighbors
+                let mut neighbors = Vec::new();
+                for &(j, ref vec_j) in &layer_nodes {
+                    if i != j {
+                        let dist = Self::cosine_similarity(vec_i, vec_j);
+                        neighbors.push((j, dist));
+                    }
+                }
+
+                // Sort by similarity and take top M
+                neighbors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_neighbors: Vec<_> = neighbors.into_iter()
+                    .take(self.m)
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                // Update connections for this node
+                if let Some(node) = self.nodes.get_mut(i) {
+                    node.connections.insert(layer, top_neighbors);
+                }
             }
         }
 

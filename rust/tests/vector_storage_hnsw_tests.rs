@@ -1,6 +1,7 @@
 use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
+use std::time::SystemTime;
 
 use super_lightrag::storage::vector::{NanoVectorStorage, VectorData, VectorStorage};
 use super_lightrag::types::{Config, Result};
@@ -24,6 +25,7 @@ async fn test_hnsw_basic_operations() -> Result<()> {
             meta.insert("label".to_string(), json!("first"));
             meta
         },
+        created_at: SystemTime::now(),
     };
 
     let vec2 = VectorData {
@@ -34,6 +36,7 @@ async fn test_hnsw_basic_operations() -> Result<()> {
             meta.insert("label".to_string(), json!("second"));
             meta
         },
+        created_at: SystemTime::now(),
     };
 
     // Test batch upsert
@@ -74,12 +77,14 @@ async fn test_hnsw_updates_and_deletions() -> Result<()> {
         id: "vec1".to_string(),
         vector: vec![1.0, 0.0, 0.0],
         metadata: HashMap::new(),
+        created_at: SystemTime::now(),
     };
 
     let vec2 = VectorData {
         id: "vec2".to_string(),
         vector: vec![0.0, 1.0, 0.0],
         metadata: HashMap::new(),
+        created_at: SystemTime::now(),
     };
 
     storage.upsert(vec![vec1, vec2]).await?;
@@ -89,6 +94,7 @@ async fn test_hnsw_updates_and_deletions() -> Result<()> {
         id: "vec2".to_string(),
         vector: vec![0.8, 0.2, 0.0], // More similar to vec1 now
         metadata: HashMap::new(),
+        created_at: SystemTime::now(),
     };
 
     let response = storage.upsert(vec![vec2_updated]).await?;
@@ -114,6 +120,7 @@ async fn test_hnsw_batch_operations() -> Result<()> {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let mut config = Config::default();
     config.working_dir = temp_dir.path().to_path_buf();
+    config.extra_config.insert("vector_db_storage.cosine_threshold".to_string(), json!(0.0));
     
     let mut storage = NanoVectorStorage::new(&config)?;
     storage.initialize().await?;
@@ -130,6 +137,7 @@ async fn test_hnsw_batch_operations() -> Result<()> {
                 meta.insert("index".to_string(), json!(i));
                 meta
             },
+            created_at: SystemTime::now(),
         });
     }
 
@@ -176,6 +184,7 @@ async fn test_hnsw_persistence_and_reload() -> Result<()> {
                 meta.insert("index".to_string(), json!(i));
                 meta
             },
+            created_at: SystemTime::now(),
         }
     }).collect();
 

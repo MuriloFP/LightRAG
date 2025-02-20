@@ -19,6 +19,10 @@ pub enum Error {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    /// Vector storage specific errors
+    #[error("Vector storage error: {0}")]
+    VectorStorage(String),
+
     /// API errors
     #[error("API error: {0}")]
     Api(String),
@@ -57,6 +61,35 @@ pub struct Config {
 
     /// API configuration
     pub api_config: ApiConfig,
+
+    /// Additional configuration values
+    #[serde(default)]
+    pub extra_config: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl Config {
+    /// Gets a float value from the extra configuration
+    pub fn get_f32(&self, key: &str) -> Option<f32> {
+        self.extra_config.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+    }
+
+    /// Gets a usize value from the extra configuration
+    pub fn get_usize(&self, key: &str) -> Option<usize> {
+        self.extra_config.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Ensures the working directory exists
+    pub fn ensure_working_dir(&self) -> Result<()> {
+        if !self.working_dir.exists() {
+            std::fs::create_dir_all(&self.working_dir)
+                .map_err(|e| Error::Config(format!("Failed to create working directory: {}", e)))?;
+        }
+        Ok(())
+    }
 }
 
 /// API provider configuration
@@ -113,7 +146,7 @@ pub struct CustomApiConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
+        let config = Self {
             working_dir: PathBuf::from("./super_lightrag_data"),
             max_memory: if cfg!(feature = "mobile") { 200 * 1024 * 1024 } else { 512 * 1024 * 1024 }, // mobile: 200MB, default: 512MB
             vector_dim: 1536,              // OpenAI's default
@@ -126,6 +159,14 @@ impl Default for Config {
                 anthropic: None,
                 custom: None,
             },
+            extra_config: std::collections::HashMap::new(),
+        };
+        
+        // Ensure working directory exists
+        if let Err(e) = config.ensure_working_dir() {
+            eprintln!("Warning: Failed to create working directory: {}", e);
         }
+        
+        config
     }
 } 

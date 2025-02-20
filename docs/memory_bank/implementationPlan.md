@@ -23,7 +23,12 @@
    - [x] Port core NanoVectorDB functionality
    - [x] Implement vector operations
    - [x] Add HNSW indexing
-   - [x] Optimize for mobile memory constraints (basic optimizations in config and upsert implemented; further optimizations pending)
+   - [x] Add cosine similarity search
+   - [x] Implement metadata management
+   - [x] Add multi-tenant support
+   - [x] Add persistence layer
+   - [x] Optimize for mobile memory constraints
+   - [x] Add thread safety and concurrency support
 
 3. **Graph Storage Integration**
    - [x] Set up graph storage structure

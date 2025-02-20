@@ -1,5 +1,4 @@
 use anyhow::{Result, Context};
-use ndarray::Array2;
 use rand::Rng;
 use serde::{Serialize, Deserialize};
 use serde_json::json;
@@ -8,13 +7,15 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use md5;
-use chrono;
 
 /// Storage container for vector data records.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Storage {
     /// Collection of vector data records.
     pub data: Vec<Data>,
+    /// Additional metadata storage
+    #[serde(default)]
+    pub additional_data: HashMap<String, serde_json::Value>,
 }
 
 /// Represents a single vector data record with metadata.
@@ -81,62 +82,127 @@ impl NanoVectorDB {
         })
     }
 
+    /// Gets additional metadata stored in the database.
+    pub fn get_additional_data(&self) -> &HashMap<String, serde_json::Value> {
+        &self.storage.additional_data
+    }
+
+    /// Stores additional metadata in the database.
+    pub fn store_additional_data(&mut self, data: HashMap<String, serde_json::Value>) {
+        self.storage.additional_data = data;
+    }
+
+    /// Gets vectors by their IDs.
+    pub fn get(&self, ids: &[String]) -> Vec<Data> {
+        let id_set: std::collections::HashSet<_> = ids.iter().collect();
+        self.storage.data.iter()
+            .filter(|data| id_set.contains(&data.__id__))
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the number of vectors in the database.
+    pub fn len(&self) -> usize {
+        self.storage.data.len()
+    }
+
+    /// Returns whether the database is empty.
+    pub fn is_empty(&self) -> bool {
+        self.storage.data.is_empty()
+    }
+
+    /// Queries the database for similar vectors.
+    pub fn query(
+        &self,
+        query: &[f64],
+        top_k: usize,
+        better_than_threshold: Option<f64>,
+        filter_lambda: Option<Box<dyn Fn(&Data) -> bool>>,
+    ) -> Vec<Data> {
+        // Normalize query vector for cosine similarity
+        let query_norm = (query.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        let query = if query_norm > 0.0 {
+            query.iter().map(|x| x / query_norm).collect::<Vec<_>>()
+        } else {
+            query.to_vec()
+        };
+
+        // Filter data if lambda provided
+        let filtered_data: Vec<_> = if let Some(filter) = filter_lambda {
+            self.storage.data.iter()
+                .filter(|data| filter(data))
+                .collect()
+        } else {
+            self.storage.data.iter().collect()
+        };
+
+        // Calculate similarities and sort
+        let mut results: Vec<_> = filtered_data.iter()
+            .map(|data| {
+                let similarity = cosine_similarity(&query, &data.__vector__);
+                (*data, similarity)
+            })
+            .filter(|(_, sim)| {
+                better_than_threshold.map_or(true, |threshold| *sim >= threshold)
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Take top_k results and format them with all required fields
+        results.into_iter()
+            .take(top_k)
+            .map(|(data, similarity)| {
+                let mut result = data.clone();
+                result.metadata.insert("__metrics__".to_string(), json!(similarity));
+                result.metadata.insert("id".to_string(), json!(data.__id__.clone()));
+                result.metadata.insert("distance".to_string(), json!(similarity));
+                result.metadata.insert("created_at".to_string(), json!(data.__created_at__));
+                result
+            })
+            .collect()
+    }
+
     /// Upserts (inserts or updates) vector records into the database.
-    /// 
-    /// # Arguments
-    /// * `records` - Vector of Data records to upsert
-    /// * `_arrays` - Vector of array representations (currently unused)
-    /// 
-    /// # Returns
-    /// A JSON value containing the IDs of inserted records
-    pub fn upsert(&mut self, records: Vec<Data>, _arrays: Vec<Array2<f64>>) -> serde_json::Value {
+    pub fn upsert(&mut self, records: Vec<Data>) -> serde_json::Value {
         let mut inserted = Vec::new();
-        let current_time = chrono::Utc::now().timestamp() as f64;
+        let mut updated = Vec::new();
+
         for mut record in records {
+            // Normalize vector for cosine similarity
+            if self.metric == "cosine" {
+                let norm = record.__vector__.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in record.__vector__.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            }
+
+            let id = record.__id__.clone();
             let mut exists = false;
+
+            // Update existing record
             for existing in &mut self.storage.data {
-                if existing.__id__ == record.__id__ {
-                    record.__created_at__ = existing.__created_at__;
+                if existing.__id__ == id {
                     *existing = record.clone();
+                    updated.push(id.clone());
                     exists = true;
                     break;
                 }
             }
+
+            // Insert new record
             if !exists {
-                record.__created_at__ = current_time;
-                self.storage.data.push(record.clone());
-                inserted.push(record.__id__);
+                self.storage.data.push(record);
+                inserted.push(id);
             }
         }
-        json!({ "insert": inserted })
-    }
 
-    /// Queries the database for vectors similar to the provided query vector.
-    /// 
-    /// # Arguments
-    /// * `query` - Query vector to find similar vectors for
-    /// * `top_k` - Number of most similar vectors to return
-    /// 
-    /// # Returns
-    /// A vector of the top_k most similar Data records
-    pub fn query(&self, query: &[f64], top_k: usize) -> Vec<Data> {
-        let mut results: Vec<(Data, f64)> = self.storage.data.iter()
-            .filter_map(|data| {
-                if data.__vector__.len() != query.len() {
-                    return None;
-                }
-                let similarity = cosine_similarity(query, &data.__vector__);
-                if similarity >= self.cosine_threshold {
-                    Some((data.clone(), similarity))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        results.truncate(top_k);
-        results.into_iter().map(|(data, _)| data).collect()
+        json!({
+            "insert": inserted,
+            "update": updated
+        })
     }
 
     /// Deletes vector records with the specified IDs from the database.
@@ -192,14 +258,7 @@ impl NanoVectorDB {
     }
 }
 
-/// Computes the cosine similarity between two vectors.
-/// 
-/// # Arguments
-/// * `v1` - First vector
-/// * `v2` - Second vector
-/// 
-/// # Returns
-/// A float value representing the cosine similarity between the vectors
+/// Computes cosine similarity between two vectors.
 fn cosine_similarity(v1: &[f64], v2: &[f64]) -> f64 {
     let dot_product: f64 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
     let norm1: f64 = v1.iter().map(|x| x * x).sum::<f64>().sqrt();

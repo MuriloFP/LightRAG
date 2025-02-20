@@ -103,6 +103,9 @@ impl SuperLightRAG {
 
     /// Initializes all storage components
     pub async fn initialize(&self) -> Result<()> {
+        // Ensure working directory exists
+        self.config.ensure_working_dir()?;
+
         let mut kv = self.kv_storage.write().await;
         let mut vector = self.vector_storage.write().await;
         let mut graph = self.graph_storage.write().await;
@@ -138,10 +141,16 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+    use tempfile::TempDir;
+    use crate::types::Config;
 
     #[tokio::test]
     async fn test_create_default() {
-        let rag = SuperLightRAG::new().await.unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mut config = Config::default();
+        config.working_dir = temp_dir.path().to_path_buf();
+        
+        let rag = SuperLightRAG::with_config(config).await.unwrap();
         assert!(rag.initialize().await.is_ok());
         assert!(rag.finalize().await.is_ok());
     }
