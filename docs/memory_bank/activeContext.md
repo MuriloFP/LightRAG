@@ -1,65 +1,60 @@
-# Current Implementation Focus: Content Processing
+# Active Context
 
-## Active Task
-Implementing content processing functionality in the Rust codebase, focusing on:
+## Current Task
+Implementing and enhancing the summary module for text processing.
 
-1. Content Cleaning Utilities ✓
-   - Created new module `src/processing/cleaning.rs` ✓
-   - Implemented HTML unescaping using `html-escape` crate ✓
-   - Added regex-based control character removal ✓
-   - Added whitespace normalization ✓
-   - Implemented UTF-8 support ✓
+### Recent Changes
+1. Created `summary.rs` module with core functionality:
+   - Implemented `SummaryError` for error handling
+   - Added `SummaryType` enum for different summary types
+   - Created `SummaryConfig` for configurable parameters
+   - Implemented `SummaryMetadata` for tracking summary statistics
+   - Added `ContentSummarizer` trait for extensibility
+   - Implemented `BasicSummarizer` with truncation and token-based summaries
 
-2. Content Validation
-   - Enhance existing `DocumentStatus` and `DocumentMetadata`
-   - Add content validation traits
-   - Implement character encoding validation
-   - Add malformed content detection
-   - Add length validation
+2. Enhanced token-based summarization:
+   - Integrated tiktoken-rs for proper tokenization
+   - Improved token counting and metadata
+   - Added support for configurable token limits
+   - Implemented smart token-based text splitting
 
-3. Content Summary Generation
-   - Start with basic truncation in `DocumentMetadata`
-   - Plan for future LLM integration
-   - Keep interface extensible
+3. Added comprehensive test coverage:
+   - Unit tests for truncation summary
+   - Unit tests for token-based summary
+   - Edge case handling tests
+   - Metadata verification tests
 
-4. Error Recovery
-   - Add retry mechanism using `tokio-retry`
-   - Implement exponential backoff
-   - Create structured error types
-   - Enhance error logging
+4. Implemented keyword extraction:
+   - Added `KeywordExtractor` trait
+   - Implemented `BasicKeywordExtractor` with TF-IDF
+   - Added `LLMKeywordExtractor` for future LLM integration
+   - Added conversation history support
+   - Added metadata tracking
+   - Added comprehensive test coverage
 
-5. Content Deduplication
-   - Use existing `compute_mdhash_id()` in `utils.rs`
-   - Add content similarity detection
-   - Implement duplicate merging strategy
-   - Add near-duplicate detection
+### Next Steps
+1. Implement LLM integration:
+   - Design LLM-based summarizer interface
+   - Add configuration for LLM parameters
+   - Implement prompt templates
 
-## Recent Changes
-- Added content cleaning module with:
-  - Configurable cleaning options
-  - HTML entity unescaping
-  - Control character removal
-  - Whitespace normalization
-  - Comprehensive test coverage
-- Added html-escape and regex dependencies
-- Added cleaning module to processing module
-- Previous changes remain:
-  - Completed document format support
-  - Added text chunking system
-  - Implemented format detection system
-  - Added PDF and Word document support
-  - Added test utilities and comprehensive tests
+2. Enhance metadata generation:
+   - Add token distribution statistics
+   - Include readability metrics
+   - Track important entities
 
-## Next Steps
-1. [x] Create `cleaning.rs` module
-2. [x] Implement content cleaning utilities
-3. [ ] Enhance content validation
-4. [ ] Add basic summary generation
-5. [ ] Implement error recovery mechanisms
-6. [ ] Add content deduplication
+3. Prepare for LLM integration:
+   - Design LLM-based summarizer interface
+   - Add configuration for LLM parameters
+   - Implement prompt templates
 
-## Dependencies
-- Added `html-escape` crate for HTML unescaping ✓
-- Added `regex` crate for text processing ✓
-- Need to add `tokio-retry` for retry mechanisms
-- Already have `md5` for deduplication hashing
+### Current Focus
+- LLM integration for keyword extraction
+- Metadata enrichment
+- Test coverage maintenance
+
+### Notes
+- Token-based summary shows good results with tiktoken
+- TF-IDF keyword extraction provides good baseline
+- Need to consider multi-language support in the future
+- Consider adding caching for tokenization results

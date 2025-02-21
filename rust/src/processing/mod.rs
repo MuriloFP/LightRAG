@@ -9,6 +9,7 @@
 mod status;
 mod chunking;
 mod types;
+mod validation;
 
 /// Document format handling and text extraction.
 /// 
@@ -30,6 +31,24 @@ pub mod formats;
 /// - Whitespace normalization
 /// - UTF-8 validation
 pub mod cleaning;
+
+/// Content summary generation.
+/// 
+/// This module provides functionality for:
+/// - Generating content summaries
+/// - Token-based summarization
+/// - Metadata extraction
+/// - Keyword identification
+pub mod summary;
+
+/// Keyword extraction and analysis.
+/// 
+/// This module provides functionality for:
+/// - High-level keyword extraction
+/// - Low-level keyword extraction
+/// - Conversation history analysis
+/// - LLM-based keyword extraction
+pub mod keywords;
 
 pub use status::{
     DocumentStatus,
@@ -55,6 +74,39 @@ pub use formats::{
     FormatError,
     detect_format,
     get_format_handler,
+};
+
+pub use validation::{
+    ValidationError,
+    ValidationResult,
+    ValidationIssue,
+    ValidationIssueType,
+    ValidationSeverity,
+    ValidationConfig,
+    ContentValidator,
+    LengthValidator,
+    EncodingValidator,
+    CompositeValidator,
+};
+
+pub use summary::{
+    SummaryError,
+    SummaryType,
+    SummaryConfig,
+    SummaryMetadata,
+    Summary,
+    ContentSummarizer,
+    BasicSummarizer,
+};
+
+pub use keywords::{
+    KeywordError,
+    ExtractedKeywords,
+    KeywordConfig,
+    KeywordExtractor,
+    ConversationTurn,
+    BasicKeywordExtractor,
+    LLMKeywordExtractor,
 };
 
 // Future processing functions and types will be added here. 
