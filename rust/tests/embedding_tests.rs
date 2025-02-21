@@ -337,7 +337,39 @@ async fn test_quantization_with_different_bits() {
     let mut cache_8bit = EmbeddingCache::new(config_8bit);
 
     // Test with different bit depths
-    let original_embedding = vec![0.1, 0.5, -0.3, 0.8, -0.6];
+    let original_embedding = vec![
+        0.123456789123456, 
+        -0.987654321987654,
+        0.555555555555555,
+        -0.333333333333333,
+        0.777777777777777,
+        0.246813579135791,
+        -0.135791357913579,
+        0.864197530864198,
+        -0.444444444444444,
+        0.666666666666667,
+        // Add more challenging values that require higher precision
+        0.123456789012345,
+        -0.987654321098765,
+        0.111111111111111,
+        -0.222222222222222,
+        0.333333333333333,
+        0.444444444444444,
+        -0.555555555555555,
+        0.666666666666666,
+        -0.777777777777777,
+        0.888888888888888,
+        0.999999999999999,
+        -0.111111111111111,
+        0.222222222222222,
+        -0.333333333333333,
+        0.444444444444444,
+        -0.555555555555555,
+        0.666666666666666,
+        -0.777777777777777,
+        0.888888888888888,
+        -0.999999999999999
+    ];
     let response = EmbeddingResponse {
         embedding: original_embedding.clone(),
         tokens_used: 2,
@@ -347,20 +379,32 @@ async fn test_quantization_with_different_bits() {
     };
 
     // Store with 4-bit quantization
-    cache_4bit.put("test_4bit".to_string(), response.clone());
+    cache_4bit.put("test_4bit".to_string(), response.clone()).unwrap();
     let retrieved_4bit = cache_4bit.get("test_4bit").unwrap();
-    
-    // Test similarity is still high despite 4-bit quantization
     let similarity_4bit = cosine_similarity(&original_embedding, &retrieved_4bit.embedding);
+    println!("4-bit similarity: {:.10}", similarity_4bit);
+    println!("4-bit values:");
+    for (i, v) in retrieved_4bit.embedding.iter().enumerate() {
+        println!("  {}: {:.10}", i, v);
+    }
+    let error_4: f32 = retrieved_4bit.metadata.get("quantization_error").unwrap().parse().unwrap();
+    println!("4-bit error: {:.10}", error_4);
     assert!(similarity_4bit > 0.95, "4-bit quantization should maintain high similarity");
 
     // Store with 8-bit quantization
-    cache_8bit.put("test_8bit".to_string(), response);
+    cache_8bit.put("test_8bit".to_string(), response).unwrap();
     let retrieved_8bit = cache_8bit.get("test_8bit").unwrap();
-    
-    // 8-bit should be more accurate than 4-bit
     let similarity_8bit = cosine_similarity(&original_embedding, &retrieved_8bit.embedding);
-    assert!(similarity_8bit > similarity_4bit, "8-bit quantization should be more accurate than 4-bit");
+    println!("8-bit similarity: {:.10}", similarity_8bit);
+    println!("8-bit values:");
+    for (i, v) in retrieved_8bit.embedding.iter().enumerate() {
+        println!("  {}: {:.10}", i, v);
+    }
+    let error_8: f32 = retrieved_8bit.metadata.get("quantization_error").unwrap().parse().unwrap();
+    println!("8-bit error: {:.10}", error_8);
+
+    // Instead of comparing cosine similarities (which are nearly 1 for both), we now assert 8-bit quantization yields lower error
+    assert!(error_8 < error_4, "8-bit quantization should have lower quantization error than 4-bit");
 }
 
 #[tokio::test]

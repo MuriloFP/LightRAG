@@ -21,7 +21,7 @@ impl MockLLMClient {
     fn new() -> Self {
         Self {
             config: LLMConfig {
-                model: String::new(),
+                model: "test-model".to_string(),
                 api_endpoint: None,
                 api_key: None,
                 org_id: None,
@@ -29,6 +29,7 @@ impl MockLLMClient {
                 max_retries: 3,
                 use_cache: false,
                 rate_limit_config: Some(RateLimitConfig::default()),
+                similarity_threshold: 0.8,
                 extra_config: HashMap::new(),
             },
         }
@@ -109,7 +110,7 @@ async fn test_fallback_behavior() {
     struct FailingMockClient;
 
     static EMPTY_CONFIG: Lazy<LLMConfig> = Lazy::new(|| LLMConfig {
-        model: String::new(),
+        model: "".to_string(),
         api_endpoint: None,
         api_key: None,
         org_id: None,
@@ -117,6 +118,7 @@ async fn test_fallback_behavior() {
         max_retries: 3,
         use_cache: false,
         rate_limit_config: Some(RateLimitConfig::default()),
+        similarity_threshold: 0.8,
         extra_config: HashMap::new(),
     });
 

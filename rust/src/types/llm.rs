@@ -199,6 +199,9 @@ pub struct LLMConfig {
     /// Rate limiting configuration
     pub rate_limit_config: Option<RateLimitConfig>,
 
+    /// Similarity threshold for cache matching (0.0 to 1.0)
+    pub similarity_threshold: f32,
+
     /// Additional configuration parameters
     pub extra_config: HashMap<String, String>,
 }
@@ -206,14 +209,15 @@ pub struct LLMConfig {
 impl Default for LLMConfig {
     fn default() -> Self {
         Self {
-            model: String::from("gpt-3.5-turbo"),
+            model: String::new(),
             api_endpoint: None,
             api_key: None,
             org_id: None,
             timeout_secs: 30,
             max_retries: 3,
-            use_cache: true,
-            rate_limit_config: Some(RateLimitConfig::default()),
+            use_cache: false,
+            rate_limit_config: None,
+            similarity_threshold: 0.8,
             extra_config: HashMap::new(),
         }
     }

@@ -1,19 +1,32 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
-use redis::Client;
+use std::time::{SystemTime, Duration};
+use redis::{Client, AsyncCommands, RedisError};
 use r2d2;
 use serde_json;
 use async_trait::async_trait;
 use std::sync::atomic::Ordering;
-
-use super::{LLMClient, LLMError, LLMResponse};
+use futures::{Stream, stream};
+use std::pin::Pin;
+use crate::types::llm::{StreamingResponse, LLMClient, LLMError, LLMResponse};
 use super::cache::{
-    config::{CacheBackend, CacheConfig, RedisConfig},
+    config::{CacheBackend, CacheConfig},
     entry::CacheEntry,
     metrics::CacheMetrics,
     ResponseCache,
 };
+
+impl From<RedisError> for LLMError {
+    fn from(err: RedisError) -> Self {
+        LLMError::CacheError(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LLMError {
+    fn from(err: serde_json::Error) -> Self {
+        LLMError::CacheError(format!("Serialization error: {}", err))
+    }
+}
 
 /// Redis-based implementation of ResponseCache
 pub struct RedisCache {
@@ -123,11 +136,17 @@ impl RedisCache {
 
     /// Put an entry with embedding for similarity search
     pub async fn put_with_embedding(&self, prompt: &str, response: LLMResponse, embedding: Vec<f32>) -> Result<(), LLMError> {
-        let mut entry = CacheEntry {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let mut conn = self.client.get_async_connection().await?;
+        let key = format!("{}:{}", self.config.prefix, prompt);
+        let entry = CacheEntry {
             response,
             created_at: SystemTime::now(),
             expires_at: self.config.ttl.map(|ttl| SystemTime::now() + ttl),
-            embedding: Some(embedding.clone()),
+            embedding: Some(embedding),
             access_count: 0,
             last_accessed: SystemTime::now(),
             llm_verified: false,
@@ -135,33 +154,20 @@ impl RedisCache {
             compressed_data: None,
             original_size: None,
             metadata: HashMap::new(),
+            chunks: None,
+            total_duration: None,
+            total_tokens: None,
+            is_streaming: false,
         };
+        let data = serde_json::to_string(&entry)?;
 
-        if self.config.use_compression {
-            entry.compress()?;
+        if let Some(ttl) = self.config.ttl {
+            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
+        } else {
+            conn.set(&key, data).await?;
         }
 
-        if self.config.validate_integrity {
-            entry.set_checksum()?;
-        }
-
-        // Store the entry
-        let mut conn = self.get_conn().await?;
-        let key = self.build_key(prompt);
-        
-        let entry_json = serde_json::to_string(&entry)
-            .map_err(|e| LLMError::CacheError(format!("Failed to serialize entry: {}", e)))?;
-
-        let _: () = redis::cmd("SET")
-            .arg(&key)
-            .arg(entry_json)
-            .query(&mut *conn)
-            .map_err(|e| LLMError::CacheError(format!("Failed to store entry: {}", e)))?;
-
-        // Store the embedding separately for faster similarity search
-        self.store_embedding(prompt, &embedding).await?;
-
-        self.metrics.size.fetch_add(1, Ordering::Relaxed);
+        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -216,6 +222,73 @@ impl RedisCache {
     /// Get cache metrics
     pub fn get_metrics(&self) -> &CacheMetrics {
         &self.metrics
+    }
+
+    fn create_entry(&self, response: LLMResponse, ttl: Option<Duration>) -> CacheEntry {
+        CacheEntry {
+            response,
+            created_at: SystemTime::now(),
+            expires_at: ttl.map(|ttl| SystemTime::now() + ttl),
+            embedding: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+            llm_verified: false,
+            checksum: None,
+            compressed_data: None,
+            original_size: None,
+            metadata: HashMap::new(),
+            chunks: None,
+            total_duration: None,
+            total_tokens: None,
+            is_streaming: false,
+        }
+    }
+
+    fn create_streaming_entry(&self, chunks: Vec<StreamingResponse>, ttl: Option<Duration>) -> CacheEntry {
+        let total_text: String = chunks.iter().map(|c| c.text.clone()).collect();
+        let total_tokens = chunks.iter().map(|c| c.chunk_tokens).sum();
+        let total_duration = chunks.last()
+            .and_then(|c| c.timing.as_ref())
+            .map(|t| t.total_duration);
+
+        let response = LLMResponse {
+            text: total_text,
+            tokens_used: total_tokens,
+            model: chunks.last()
+                .map(|c| c.metadata.get("model").cloned().unwrap_or_default())
+                .unwrap_or_default(),
+            cached: true,
+            context: None,
+            metadata: chunks.last()
+                .map(|c| c.metadata.clone())
+                .unwrap_or_default(),
+        };
+
+        CacheEntry {
+            response,
+            created_at: SystemTime::now(),
+            expires_at: ttl.map(|ttl| SystemTime::now() + ttl),
+            embedding: None,
+            access_count: 0,
+            last_accessed: SystemTime::now(),
+            llm_verified: false,
+            checksum: None,
+            compressed_data: None,
+            original_size: None,
+            metadata: HashMap::new(),
+            chunks: Some(chunks),
+            total_duration,
+            total_tokens: Some(total_tokens),
+            is_streaming: true,
+        }
+    }
+
+    fn is_expired(&self, entry: &CacheEntry) -> bool {
+        if let Some(expires_at) = entry.expires_at {
+            SystemTime::now() > expires_at
+        } else {
+            false
+        }
     }
 }
 
@@ -275,9 +348,8 @@ impl ResponseCache for RedisCache {
             return Ok(());
         }
 
-        let mut conn = self.get_conn().await?;
-        let key = self.build_key(prompt);
-
+        let mut conn = self.client.get_async_connection().await?;
+        let key = format!("{}:{}", self.config.prefix, prompt);
         let entry = CacheEntry {
             response,
             created_at: SystemTime::now(),
@@ -290,29 +362,20 @@ impl ResponseCache for RedisCache {
             compressed_data: None,
             original_size: None,
             metadata: HashMap::new(),
+            chunks: None,
+            total_duration: None,
+            total_tokens: None,
+            is_streaming: false,
         };
+        let data = serde_json::to_string(&entry)?;
 
-        // Serialize entry
-        let entry_json = serde_json::to_string(&entry)
-            .map_err(|e| LLMError::CacheError(format!("Failed to serialize entry: {}", e)))?;
-
-        // Set with expiry if TTL is configured
         if let Some(ttl) = self.config.ttl {
-            let _: () = redis::cmd("SETEX")
-                .arg(&key)
-                .arg(ttl.as_secs())
-                .arg(entry_json)
-                .query(&mut *conn)
-                .map_err(|e| LLMError::CacheError(format!("Failed to set cache entry: {}", e)))?;
+            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
         } else {
-            let _: () = redis::cmd("SET")
-                .arg(&key)
-                .arg(entry_json)
-                .query(&mut *conn)
-                .map_err(|e| LLMError::CacheError(format!("Failed to set cache entry: {}", e)))?;
+            conn.set(&key, data).await?;
         }
 
-        self.metrics.size.fetch_add(1, Ordering::Relaxed);
+        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -371,6 +434,51 @@ impl ResponseCache for RedisCache {
 
     fn update_config(&mut self, config: CacheConfig) -> Result<(), LLMError> {
         self.config = config;
+        Ok(())
+    }
+
+    async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>> {
+        if !self.config.enabled || !self.config.stream_cache_enabled {
+            return None;
+        }
+
+        let mut conn = self.client.get_async_connection().await.ok()?;
+        let key = format!("{}:{}", self.config.prefix, prompt);
+        let data: Option<String> = conn.get(&key).await.ok()?;
+
+        if let Some(data) = data {
+            if let Ok(entry) = serde_json::from_str::<CacheEntry>(&data) {
+                if !self.is_expired(&entry) && entry.is_streaming() {
+                    if let Some(chunks) = entry.get_chunks() {
+                        self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let chunks = chunks.to_vec();
+                        return Some(Box::pin(stream::iter(chunks.into_iter().map(Ok))));
+                    }
+                }
+            }
+        }
+
+        self.metrics.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError> {
+        if !self.config.enabled || !self.config.stream_cache_enabled {
+            return Ok(());
+        }
+
+        let mut conn = self.client.get_async_connection().await?;
+        let key = format!("{}:{}", self.config.prefix, prompt);
+        let entry = self.create_streaming_entry(chunks, self.config.stream_ttl);
+        let data = serde_json::to_string(&entry)?;
+
+        if let Some(ttl) = self.config.stream_ttl {
+            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
+        } else {
+            conn.set(&key, data).await?;
+        }
+
+        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 } 

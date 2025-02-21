@@ -3,6 +3,7 @@ use std::time::{SystemTime, Duration};
 use serde::{Serialize, Deserialize};
 use crate::llm::LLMError;
 use crate::llm::LLMResponse;
+use crate::types::llm::StreamingResponse;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 /// Entry in the cache
@@ -44,6 +45,21 @@ pub struct CacheEntry {
 
     /// Metadata for custom tracking
     pub metadata: HashMap<String, String>,
+
+    /// Streaming chunks if this was a streaming response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<StreamingResponse>>,
+
+    /// Total duration of streaming response in microseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_duration: Option<u64>,
+
+    /// Total tokens across all chunks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<usize>,
+
+    /// Whether this entry was from a streaming response
+    pub is_streaming: bool,
 }
 
 impl CacheEntry {
@@ -62,6 +78,51 @@ impl CacheEntry {
             compressed_data: None,
             original_size: None,
             metadata: HashMap::new(),
+            chunks: None,
+            total_duration: None,
+            total_tokens: None,
+            is_streaming: false,
+        }
+    }
+
+    /// Create a new streaming cache entry
+    pub fn new_streaming(chunks: Vec<StreamingResponse>, ttl: Option<Duration>) -> Self {
+        let now = SystemTime::now();
+        let total_text: String = chunks.iter().map(|c| c.text.clone()).collect();
+        let total_tokens = chunks.iter().map(|c| c.chunk_tokens).sum();
+        let total_duration = chunks.last()
+            .and_then(|c| c.timing.as_ref())
+            .map(|t| t.total_duration);
+
+        let response = LLMResponse {
+            text: total_text,
+            tokens_used: total_tokens,
+            model: chunks.last()
+                .map(|c| c.metadata.get("model").cloned().unwrap_or_default())
+                .unwrap_or_default(),
+            cached: true,
+            context: None,
+            metadata: chunks.last()
+                .map(|c| c.metadata.clone())
+                .unwrap_or_default(),
+        };
+
+        Self {
+            response,
+            created_at: now,
+            expires_at: ttl.map(|ttl| now + ttl),
+            embedding: None,
+            access_count: 0,
+            last_accessed: now,
+            llm_verified: false,
+            checksum: None,
+            compressed_data: None,
+            original_size: None,
+            metadata: HashMap::new(),
+            chunks: Some(chunks),
+            total_duration,
+            total_tokens: Some(total_tokens),
+            is_streaming: true,
         }
     }
 
@@ -155,5 +216,25 @@ impl CacheEntry {
         } else {
             Ok(true)
         }
+    }
+
+    /// Get the streaming chunks if available
+    pub fn get_chunks(&self) -> Option<&[StreamingResponse]> {
+        self.chunks.as_deref()
+    }
+
+    /// Check if this is a streaming entry
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
+    }
+
+    /// Get total duration of streaming response
+    pub fn get_total_duration(&self) -> Option<u64> {
+        self.total_duration
+    }
+
+    /// Get total tokens across all chunks
+    pub fn get_total_tokens(&self) -> Option<usize> {
+        self.total_tokens
     }
 } 

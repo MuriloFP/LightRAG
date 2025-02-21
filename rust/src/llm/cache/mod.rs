@@ -9,7 +9,10 @@ pub use metrics::*;
 pub use memory::*;
 
 use async_trait::async_trait;
+use futures::Stream;
+use std::pin::Pin;
 use crate::llm::{LLMError, LLMResponse};
+use crate::types::llm::StreamingResponse;
 
 /// Trait for cache implementations
 #[async_trait]
@@ -19,6 +22,12 @@ pub trait ResponseCache: Send + Sync {
     
     /// Store a response in the cache
     async fn put(&self, prompt: &str, response: LLMResponse) -> Result<(), LLMError>;
+
+    /// Get a cached streaming response
+    async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>>;
+
+    /// Store a streaming response in the cache
+    async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError>;
     
     /// Remove expired entries
     async fn cleanup(&self) -> Result<(), LLMError>;

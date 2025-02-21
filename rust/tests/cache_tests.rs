@@ -20,8 +20,9 @@ fn create_test_response(text: &str) -> LLMResponse {
 async fn test_redis_cache() {
     let config = CacheConfig {
         enabled: true,
-        max_entries: 10000,
+        max_entries: Some(10000),
         ttl: Some(std::time::Duration::from_secs(3600)),
+        similarity_enabled: true,
         use_fuzzy_match: true,
         similarity_threshold: 0.95,
         use_persistent: false,
@@ -40,6 +41,11 @@ async fn test_redis_cache() {
         validate_integrity: true,
         enable_sync: false,
         sync_interval: None,
+        stream_cache_enabled: true,
+        max_stream_chunks: Some(1000),
+        compress_streams: false,
+        stream_ttl: Some(std::time::Duration::from_secs(1800)),
+        prefix: "cache".to_string(),
     };
 
     if let Ok(cache) = RedisCache::new(config).await {
@@ -70,8 +76,9 @@ async fn test_redis_cache() {
 async fn test_redis_cache_expiration() {
     let mut config = CacheConfig {
         enabled: true,
-        max_entries: 10000,
+        max_entries: Some(10000),
         ttl: Some(std::time::Duration::from_secs(1)),
+        similarity_enabled: true,
         use_fuzzy_match: true,
         similarity_threshold: 0.95,
         use_persistent: false,
@@ -90,6 +97,11 @@ async fn test_redis_cache_expiration() {
         validate_integrity: true,
         enable_sync: false,
         sync_interval: None,
+        stream_cache_enabled: true,
+        max_stream_chunks: Some(1000),
+        compress_streams: false,
+        stream_ttl: Some(std::time::Duration::from_secs(1800)),
+        prefix: "cache".to_string(),
     };
 
     if let Ok(cache) = RedisCache::new(config).await {
@@ -111,8 +123,9 @@ async fn test_redis_cache_expiration() {
 async fn test_redis_cache_similarity_search() {
     let mut config = CacheConfig {
         enabled: true,
-        max_entries: 10000,
+        max_entries: Some(10000),
         ttl: Some(std::time::Duration::from_secs(3600)),
+        similarity_enabled: true,
         use_fuzzy_match: true,
         similarity_threshold: 0.8,
         use_persistent: false,
@@ -131,6 +144,11 @@ async fn test_redis_cache_similarity_search() {
         validate_integrity: true,
         enable_sync: false,
         sync_interval: None,
+        stream_cache_enabled: true,
+        max_stream_chunks: Some(1000),
+        compress_streams: false,
+        stream_ttl: Some(std::time::Duration::from_secs(1800)),
+        prefix: "cache".to_string(),
     };
 
     if let Ok(cache) = RedisCache::new(config).await {

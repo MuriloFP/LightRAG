@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, Duration};
+use std::time::SystemTime;
 use crate::types::embeddings::{EmbeddingResponse, CacheConfig, EmbeddingError};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
@@ -91,7 +91,13 @@ impl EmbeddingCache {
                     return None;
                 }
             }
-            return Some(entry.response.clone());
+            let mut response = entry.response.clone();
+            if response.metadata.get("quantization_error").is_none() {
+                if let Some(q_err) = entry.quantization_error {
+                    response.metadata.insert("quantization_error".to_string(), q_err.to_string());
+                }
+            }
+            return Some(response);
         }
         
         None
@@ -119,58 +125,71 @@ impl EmbeddingCache {
 
     /// Quantize a floating-point embedding to n-bit integers
     fn quantize_embedding(&self, embedding: &[f32]) -> Result<(Vec<u8>, f32, f32, f32), EmbeddingError> {
-        if !self.config.use_quantization {
-            // If quantization is disabled, just convert to bytes
-            let bytes: Vec<u8> = embedding.iter()
-                .flat_map(|x| x.to_le_bytes().to_vec())
-                .collect();
-            return Ok((bytes, 0.0, 0.0, 0.0));
+        if embedding.is_empty() {
+            return Err(EmbeddingError::QuantizationError("Empty embedding vector".to_string()));
         }
 
-        let bits = self.calculate_optimal_bits(embedding);
-        let min_val = embedding.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max_val = embedding.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
-        if min_val == max_val {
-            return Err(EmbeddingError::QuantizationError("Zero variance in embedding".to_string()));
+        // Find true min/max values
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        for &val in embedding {
+            min_val = min_val.min(val);
+            max_val = max_val.max(val);
         }
 
-        let scale = (max_val - min_val) / ((1 << bits) - 1) as f32;
-        
-        let quantized: Vec<u8> = embedding.iter()
-            .map(|&x| ((x - min_val) / scale) as u8)
-            .collect();
+        // Calculate scale factor based on number of bits
+        let bits = self.config.quantization_bits;
+        let levels = (1u32 << bits) - 1;
+        let scale = (max_val - min_val) / levels as f32;
 
-        // Calculate quantization error
-        let dequantized = self.dequantize_embedding(&quantized, min_val, max_val)?;
-        let error = embedding.iter()
-            .zip(dequantized.iter())
-            .map(|(&orig, &deq)| (orig - deq).powi(2))
-            .sum::<f32>()
-            .sqrt() / embedding.len() as f32;
-            
-        Ok((quantized, min_val, max_val, error))
+        // Avoid division by zero
+        if scale == 0.0 {
+            return Err(EmbeddingError::QuantizationError("Zero scale factor".to_string()));
+        }
+
+        // Quantize values
+        let mut quantized = Vec::with_capacity(embedding.len());
+        let mut total_error = 0.0;
+
+        for &val in embedding {
+            // Scale and round to nearest integer
+            let scaled = ((val - min_val) / scale).round() as u32;
+            // Clamp to valid range
+            let clamped = scaled.min(levels);
+            let quantized_val = clamped as u8;
+            quantized.push(quantized_val);
+
+            // Calculate error in original space
+            let reconstructed = (quantized_val as f32 * scale) + min_val;
+            let error = (val - reconstructed).abs();
+            total_error += error;
+        }
+
+        let avg_error = total_error / embedding.len() as f32;
+        Ok((quantized, min_val, max_val, avg_error))
     }
-    
+
     /// Dequantize an n-bit integer embedding back to floating-point
-    fn dequantize_embedding(&self, quantized: &[u8], min_val: f32, max_val: f32) -> Result<Vec<f32>, EmbeddingError> {
-        if !self.config.use_quantization {
-            // If quantization is disabled, just convert from bytes
-            return Ok(quantized.chunks(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect());
+    fn dequantize_embedding(&self, quantized: &[u8], min_val: f32, max_val: f32, original_len: usize) -> Result<Vec<f32>, EmbeddingError> {
+        if quantized.is_empty() {
+            return Err(EmbeddingError::QuantizationError("Empty quantized vector".to_string()));
         }
 
-        if min_val == max_val {
-            return Err(EmbeddingError::QuantizationError("Invalid min/max values".to_string()));
+        if original_len != quantized.len() {
+            return Err(EmbeddingError::QuantizationError("Length mismatch".to_string()));
         }
 
-        let bits = self.calculate_optimal_bits(&vec![min_val, max_val]);
-        let scale = (max_val - min_val) / ((1 << bits) - 1) as f32;
-        
-        Ok(quantized.iter()
-            .map(|&x| min_val + (x as f32) * scale)
-            .collect())
+        let bits = self.config.quantization_bits;
+        let levels = (1u32 << bits) - 1;
+        let scale = (max_val - min_val) / levels as f32;
+
+        let mut dequantized = Vec::with_capacity(original_len);
+        for &q in quantized {
+            let val = (q as f32 * scale) + min_val;
+            dequantized.push(val);
+        }
+
+        Ok(dequantized)
     }
 
     /// Compress data using LZ4 with configurable level
@@ -212,22 +231,41 @@ impl EmbeddingCache {
             return Ok(());
         }
 
-        // Quantize the embedding
-        let (quantized, min_val, max_val, error) = self.quantize_embedding(&response.embedding)?;
-        
-        // Update quantization stats
-        self.stats.quantized_entries += 1;
-        self.stats.avg_quantization_error = (self.stats.avg_quantization_error * (self.stats.quantized_entries - 1) as f32 + error) 
-            / self.stats.quantized_entries as f32;
+        let embedding = response.embedding.clone();
+        let mut entry = CacheEntry {
+            response,
+            timestamp: SystemTime::now(),
+            quantized_embedding: None,
+            min_val: None,
+            max_val: None,
+            compressed_data: None,
+            original_size: None,
+            quantization_error: None,
+        };
+        if self.config.use_quantization {
+            let (quantized, min_val, max_val, quant_error) = self.quantize_embedding(&embedding)?;
+            entry.quantized_embedding = Some(quantized);
+            entry.min_val = Some(min_val);
+            entry.max_val = Some(max_val);
+            entry.quantization_error = Some(quant_error);
+        }
+        // Ensure quantization_error is set even if it is None
+        if self.config.use_quantization && entry.quantization_error.is_none() {
+            entry.quantization_error = Some(0.0);
+        }
+        // Insert quantization error into metadata
+        if let Some(q_err) = entry.quantization_error {
+            entry.response.metadata.insert("quantization_error".to_string(), q_err.to_string());
+        }
 
         // Compress the quantized data if enabled
-        let (compressed_data, original_size) = if self.config.use_compression {
-            if let Some(compressed) = self.compress_data(&quantized) {
+        let (compressed_data, original_size) = if let Some(q_embedding) = entry.quantized_embedding.as_ref() {
+            if let Some(compressed) = self.compress_data(q_embedding) {
                 self.stats.compressed_entries += 1;
-                self.stats.total_original_size += quantized.len();
+                self.stats.total_original_size += q_embedding.len();
                 self.stats.total_compressed_size += compressed.len();
                 self.stats.avg_compression_ratio = (self.stats.total_original_size as f32) / (self.stats.total_compressed_size as f32);
-                (Some(compressed), Some(quantized.len()))
+                (Some(compressed), Some(q_embedding.len()))
             } else {
                 (None, None)
             }
@@ -242,16 +280,7 @@ impl EmbeddingCache {
             }
         }
 
-        self.entries.insert(text, CacheEntry {
-            response,
-            timestamp: SystemTime::now(),
-            quantized_embedding: Some(quantized),
-            min_val: Some(min_val),
-            max_val: Some(max_val),
-            compressed_data,
-            original_size,
-            quantization_error: Some(error),
-        });
+        self.entries.insert(text, entry);
 
         self.stats.total_entries = self.entries.len();
         Ok(())
@@ -259,52 +288,22 @@ impl EmbeddingCache {
 
     /// Get a cached response using similarity matching with quantized embeddings
     pub fn get_similar(&self, embedding: &[f32], threshold: f32) -> Option<EmbeddingResponse> {
-        if !self.config.enabled || threshold <= 0.0 {
+        if !self.config.enabled {
             return None;
         }
 
-        let mut best_match = None;
         let mut best_similarity = threshold;
-
-        // Quantize the query embedding
-        let (query_quantized, query_min, query_max, _) = self.quantize_embedding(embedding).ok()?;
+        let mut best_response = None;
 
         for entry in self.entries.values() {
-            // Check TTL
-            if let Some(ttl) = self.config.ttl_seconds {
-                if entry.timestamp.elapsed().unwrap().as_secs() > ttl {
-                    continue;
-                }
-            }
-
-            let stored_embedding = if let Some(compressed) = &entry.compressed_data {
-                // Use compressed data if available
-                match self.decompress_data(compressed) {
-                    Ok(decompressed) => decompressed,
-                    Err(_) => entry.quantized_embedding.as_ref()?.clone(),
-                }
-            } else {
-                entry.quantized_embedding.as_ref()?.clone()
-            };
-
-            // Dequantize the stored embedding
-            let dequantized = match self.dequantize_embedding(
-                &stored_embedding,
-                entry.min_val?,
-                entry.max_val?
-            ) {
-                Ok(deq) => deq,
-                Err(_) => continue,
-            };
-
-            let similarity = cosine_similarity(embedding, &dequantized);
+            let similarity = cosine_similarity(embedding, &entry.response.embedding);
             if similarity > best_similarity {
                 best_similarity = similarity;
-                best_match = Some(entry.response.clone());
+                best_response = Some(entry.response.clone());
             }
         }
 
-        best_match
+        best_response
     }
     
     /// Evict the oldest entries from the cache

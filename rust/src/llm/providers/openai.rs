@@ -91,7 +91,7 @@ impl OpenAIClient {
         let endpoint = self.config.api_endpoint.as_ref()
             .ok_or_else(|| LLMError::ConfigError("API endpoint not configured".to_string()))?;
             
-        Ok(format!("{}/v1/completions", endpoint))
+        Ok(format!("{}/v1/chat/completions", endpoint))
     }
     
     /// Build request headers
@@ -165,9 +165,9 @@ impl OpenAIClient {
         if let Some(cache) = &self.cache {
             if let Some(query_params) = &params.query_params {
                 if let Some(embedding) = self.get_embedding(query).await? {
-                    if let Some(cached_response) = cache.find_similar_entry(
-                        &embedding,
-                        query_params.similarity_threshold
+                    if let Some(cached_response) = cache.find_similar(
+                        embedding,
+                        self.config.similarity_threshold,
                     ).await {
                         return Ok(cached_response);
                     }

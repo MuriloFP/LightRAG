@@ -122,9 +122,9 @@ impl OllamaClient {
         if let Some(cache) = &self.cache {
             if let Some(query_params) = &params.query_params {
                 if let Some(embedding) = self.get_embedding(query).await? {
-                    if let Some(cached_response) = cache.find_similar_entry(
-                        &embedding,
-                        query_params.similarity_threshold
+                    if let Some(cached_response) = cache.find_similar(
+                        embedding,
+                        self.config.similarity_threshold,
                     ).await {
                         return Ok(cached_response);
                     }
