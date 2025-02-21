@@ -33,4 +33,9 @@ pub mod vector;
 /// - Relationship mapping and traversal
 /// - Pattern matching and subgraph extraction
 /// - Efficient graph persistence
-pub mod graph; 
+pub mod graph;
+
+// Re-export storage traits
+pub use kv::KVStorage;
+pub use vector::VectorStorage;
+pub use graph::GraphStorage; 

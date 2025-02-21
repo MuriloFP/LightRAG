@@ -7,6 +7,9 @@ use serde_json::Value;
 /// Trait for graph storage operations
 #[async_trait]
 pub trait GraphStorage: Send + Sync {
+    /// Query the graph using keywords
+    async fn query_with_keywords(&self, keywords: &[String]) -> Result<String>;
+
     /// Initializes the graph storage system.
     /// 
     /// This method should be called before any other operations to:

@@ -34,6 +34,12 @@ pub trait KVStorage: Send + Sync {
     /// Drop all data from storage
     async fn drop(&mut self) -> Result<()>;
 
+    /// Clear all data from storage and persist the empty state
+    async fn clear(&mut self) -> Result<()> {
+        self.drop().await?;
+        self.finalize().await
+    }
+
     /// Called after indexing operations are complete
     /// Default implementation persists data
     async fn index_done_callback(&mut self) -> Result<()> {

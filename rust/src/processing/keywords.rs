@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tiktoken_rs::cl100k_base;
+use crate::types::llm::{LLMClient, LLMParams};
+use std::sync::Arc;
 
 /// Errors that can occur during keyword extraction
 #[derive(Error, Debug)]
@@ -41,18 +43,22 @@ pub struct ExtractedKeywords {
 }
 
 /// Configuration for keyword extraction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct KeywordConfig {
     /// Maximum number of high-level keywords to extract
     pub max_high_level: usize,
+    
     /// Maximum number of low-level keywords to extract
     pub max_low_level: usize,
-    /// Language of the content
+    
+    /// Language for keyword extraction (optional)
     pub language: Option<String>,
+    
     /// Whether to use LLM for extraction
     pub use_llm: bool,
-    /// Additional configuration parameters
-    pub extra_params: HashMap<String, serde_json::Value>,
+    
+    /// Additional parameters
+    pub extra_params: HashMap<String, String>,
 }
 
 impl Default for KeywordConfig {
@@ -67,7 +73,7 @@ impl Default for KeywordConfig {
     }
 }
 
-/// A turn in a conversation
+/// A turn in a conversation with timestamp information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
     /// The role of the speaker (e.g., "user", "assistant")
@@ -211,12 +217,87 @@ impl KeywordExtractor for BasicKeywordExtractor {
 /// LLM-based implementation of keyword extraction
 pub struct LLMKeywordExtractor {
     config: KeywordConfig,
+    llm_client: Arc<dyn LLMClient>,
+    llm_params: LLMParams,
 }
 
 impl LLMKeywordExtractor {
-    /// Create a new LLMKeywordExtractor with the given configuration
-    pub fn new(config: KeywordConfig) -> Self {
-        Self { config }
+    /// Create a new LLMKeywordExtractor with the given configuration and client
+    pub fn new(config: KeywordConfig, llm_client: Arc<dyn LLMClient>, llm_params: LLMParams) -> Self {
+        Self { 
+            config,
+            llm_client,
+            llm_params,
+        }
+    }
+
+    /// Generate prompt for keyword extraction
+    fn generate_prompt(&self, content: &str, history: Option<&[ConversationTurn]>) -> String {
+        let mut prompt = String::new();
+        
+        // Add history context if available
+        if let Some(hist) = history {
+            prompt.push_str("Previous conversation:\n");
+            for turn in hist {
+                prompt.push_str(&format!("- {}\n", turn.content));
+            }
+            prompt.push_str("\n");
+        }
+
+        // Main extraction prompt
+        prompt.push_str(&format!(
+            "Please extract keywords from the following text. Categorize them into:\n\
+            1. High-level keywords: Abstract concepts and main themes (max {})\n\
+            2. Low-level keywords: Specific terms and details (max {})\n\n\
+            Text:\n{}\n\n\
+            Return the keywords in JSON format:\n\
+            {{\n\
+                \"high_level_keywords\": [\"keyword1\", \"keyword2\"],\n\
+                \"low_level_keywords\": [\"keyword1\", \"keyword2\"]\n\
+            }}",
+            self.config.max_high_level,
+            self.config.max_low_level,
+            content
+        ));
+
+        prompt
+    }
+
+    /// Parse LLM response into keywords
+    fn parse_response(&self, response: &str) -> Result<ExtractedKeywords, Error> {
+        let json_start = response.find('{').ok_or_else(|| 
+            KeywordError::ExtractionError("No JSON found in response".to_string()))?;
+        let json_end = response.rfind('}').ok_or_else(|| 
+            KeywordError::ExtractionError("No JSON found in response".to_string()))?;
+        
+        let json_str = &response[json_start..=json_end];
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| KeywordError::ExtractionError(format!("JSON parsing error: {}", e)))?;
+
+        let high_level = parsed["high_level_keywords"]
+            .as_array()
+            .ok_or_else(|| KeywordError::ExtractionError("Missing high_level_keywords".to_string()))?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        let low_level = parsed["low_level_keywords"]
+            .as_array()
+            .ok_or_else(|| KeywordError::ExtractionError("Missing low_level_keywords".to_string()))?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        Ok(ExtractedKeywords {
+            high_level,
+            low_level,
+            metadata: {
+                let mut meta = HashMap::new();
+                meta.insert("extraction_method".to_string(), serde_json::json!("llm"));
+                meta.insert("timestamp".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+                meta
+            },
+        })
     }
 }
 
@@ -226,17 +307,30 @@ impl KeywordExtractor for LLMKeywordExtractor {
         if content.is_empty() {
             return Err(KeywordError::EmptyContent.into());
         }
-        // TODO: Implement LLM-based extraction once we have the LLM module
-        Err(KeywordError::ExtractionError("LLM extraction not yet implemented".to_string()).into())
+
+        let prompt = self.generate_prompt(content, None);
+        let response = self.llm_client.generate(&prompt, &self.llm_params)
+            .await
+            .map_err(|e| KeywordError::LLMError(e.to_string()))?;
+
+        self.parse_response(&response.text)
     }
 
     async fn extract_keywords_with_history(
         &self,
         content: &str,
-        _history: &[ConversationTurn]
+        history: &[ConversationTurn]
     ) -> Result<ExtractedKeywords, Error> {
-        // TODO: Implement with history support
-        self.extract_keywords(content).await
+        if content.is_empty() {
+            return Err(KeywordError::EmptyContent.into());
+        }
+
+        let prompt = self.generate_prompt(content, Some(history));
+        let response = self.llm_client.generate(&prompt, &self.llm_params)
+            .await
+            .map_err(|e| KeywordError::LLMError(e.to_string()))?;
+
+        self.parse_response(&response.text)
     }
 
     fn get_config(&self) -> &KeywordConfig {

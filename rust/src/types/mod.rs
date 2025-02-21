@@ -4,6 +4,29 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+// Submodules
+/// Language model (LLM) types and interfaces.
+/// 
+/// This module provides:
+/// - Common types for LLM interactions
+/// - Client trait definitions
+/// - Configuration structures
+/// - Error types specific to LLM operations
+pub mod llm;
+
+/// Embedding types and interfaces.
+/// 
+/// This module provides:
+/// - Common types for embedding operations
+/// - Provider trait definitions
+/// - Configuration structures
+/// - Error types specific to embedding operations
+pub mod embeddings;
+
+// Re-exports
+pub use llm::{LLMClient, LLMConfig, LLMParams, LLMResponse, LLMError};
+pub use embeddings::{EmbeddingProvider, EmbeddingConfig, EmbeddingError, EmbeddingResponse};
+
 /// Custom error type for SuperLightRAG operations
 #[derive(Error, Debug)]
 pub enum Error {

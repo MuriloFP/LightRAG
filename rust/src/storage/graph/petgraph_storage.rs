@@ -872,6 +872,37 @@ impl PetgraphStorage {
             }
         }
     }
+
+    async fn query_with_keywords(&self, keywords: &[String]) -> Result<String> {
+        let mut context = String::new();
+        
+        for keyword in keywords {
+            // Search for nodes containing the keyword
+            for node_index in self.graph.node_indices() {
+                if let Some(node_data) = self.graph.node_weight(node_index) {
+                    if let Some(content) = node_data.attributes.get("content").and_then(|v| v.as_str()) {
+                        if content.to_lowercase().contains(&keyword.to_lowercase()) {
+                            // Add node content to context
+                            context.push_str(content);
+                            context.push_str("\n");
+                            
+                            // Get connected nodes (both incoming and outgoing edges)
+                            for neighbor in self.graph.neighbors(node_index) {
+                                if let Some(neighbor_data) = self.graph.node_weight(neighbor) {
+                                    if let Some(neighbor_content) = neighbor_data.attributes.get("content").and_then(|v| v.as_str()) {
+                                        context.push_str(neighbor_content);
+                                        context.push_str("\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(context)
+    }
 }
 
 #[async_trait]
@@ -1201,6 +1232,37 @@ impl GraphStorage for PetgraphStorage {
                 }
             }
         }).await?
+    }
+
+    async fn query_with_keywords(&self, keywords: &[String]) -> Result<String> {
+        let mut context = String::new();
+        
+        for keyword in keywords {
+            // Search for nodes containing the keyword
+            for node_index in self.graph.node_indices() {
+                if let Some(node_data) = self.graph.node_weight(node_index) {
+                    if let Some(content) = node_data.attributes.get("content").and_then(|v| v.as_str()) {
+                        if content.to_lowercase().contains(&keyword.to_lowercase()) {
+                            // Add node content to context
+                            context.push_str(content);
+                            context.push_str("\n");
+                            
+                            // Get connected nodes (both incoming and outgoing edges)
+                            for neighbor in self.graph.neighbors(node_index) {
+                                if let Some(neighbor_data) = self.graph.node_weight(neighbor) {
+                                    if let Some(neighbor_content) = neighbor_data.attributes.get("content").and_then(|v| v.as_str()) {
+                                        context.push_str(neighbor_content);
+                                        context.push_str("\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(context)
     }
 }
 

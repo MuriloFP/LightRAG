@@ -36,6 +36,15 @@ pub mod processing;
 /// - Authentication and rate limiting
 pub mod api;
 
+/// LLM module for language model operations.
+/// 
+/// Provides:
+/// - LLM client interfaces
+/// - Response caching
+/// - Provider implementations (OpenAI, Ollama)
+/// - Error handling and retries
+pub mod llm;
+
 /// Common types and configuration structures.
 /// 
 /// Contains:
@@ -62,6 +71,14 @@ pub mod utils;
 /// - Cross-platform compatibility
 /// - Persistence capabilities
 pub mod nano_vectordb;
+
+/// Embeddings module for handling embeddings and similarity search.
+/// 
+/// Provides:
+/// - Embedding generation
+/// - Similarity search
+/// - Embedding storage
+pub mod embeddings;
 
 // Re-exports
 pub use crate::types::{Error, Result};

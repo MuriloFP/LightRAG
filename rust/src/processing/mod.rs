@@ -50,6 +50,28 @@ pub mod summary;
 /// - LLM-based keyword extraction
 pub mod keywords;
 
+/// Context building for LLM queries.
+/// 
+/// This module provides functionality for:
+/// - Building context based on query mode
+/// - Local context from text chunks
+/// - Global context from knowledge graph
+/// - Hybrid context combining both approaches
+pub mod context;
+
+/// Document processing and status management.
+/// 
+/// This module provides functionality for:
+/// - Document status tracking and transitions
+/// - Batch document processing
+/// - Content summarization and keyword extraction
+/// - Deduplication handling
+/// - Parallel processing capabilities
+pub mod document;
+
+pub mod entity;
+pub use entity::{EntityExtractor, EntityType, Entity, Relationship, LLMEntityExtractor};
+
 pub use status::{
     DocumentStatus,
     DocumentMetadata,
@@ -108,5 +130,19 @@ pub use keywords::{
     BasicKeywordExtractor,
     LLMKeywordExtractor,
 };
+
+pub use document::{
+    DocumentProcessor,
+    DocumentProcessingConfig,
+    DocumentProcessingStatus,
+    DocumentError,
+};
+
+pub mod query;
+
+pub use context::*;
+pub use entity::*;
+pub use keywords::*;
+pub use query::*;
 
 // Future processing functions and types will be added here. 
