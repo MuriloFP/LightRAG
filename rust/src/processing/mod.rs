@@ -22,6 +22,15 @@ mod types;
 ///   - Word documents (.docx)
 pub mod formats;
 
+/// Content cleaning and normalization.
+/// 
+/// This module provides functionality for:
+/// - HTML entity unescaping
+/// - Control character removal
+/// - Whitespace normalization
+/// - UTF-8 validation
+pub mod cleaning;
+
 pub use status::{
     DocumentStatus,
     DocumentMetadata,
