@@ -2,11 +2,13 @@ pub mod config;
 pub mod entry;
 pub mod metrics;
 pub mod memory;
+pub mod types;
 
 pub use config::*;
 pub use entry::*;
 pub use metrics::*;
 pub use memory::*;
+pub use types::CacheType;
 
 use async_trait::async_trait;
 use futures::Stream;

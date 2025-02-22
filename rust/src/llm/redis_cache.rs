@@ -15,6 +15,7 @@ use super::cache::{
     metrics::CacheMetrics,
     ResponseCache,
 };
+use super::types::CacheType;
 
 impl From<RedisError> for LLMError {
     fn from(err: RedisError) -> Self {
@@ -83,8 +84,12 @@ impl RedisCache {
     }
 
     /// Build cache key
-    fn build_key(&self, key: &str) -> String {
-        format!("llm:cache:{}", key)
+    fn build_key(&self, prompt: &str) -> String {
+        format!("{}:{}:{}",
+            self.config.prefix,
+            self.config.cache_type.as_str(),
+            prompt
+        )
     }
 
     /// Calculate cosine similarity between two vectors
@@ -150,6 +155,7 @@ impl RedisCache {
             access_count: 0,
             last_accessed: SystemTime::now(),
             llm_verified: false,
+            cache_type: self.config.cache_type.clone(),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -233,6 +239,7 @@ impl RedisCache {
             access_count: 0,
             last_accessed: SystemTime::now(),
             llm_verified: false,
+            cache_type: self.config.cache_type.clone(),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -272,6 +279,7 @@ impl RedisCache {
             access_count: 0,
             last_accessed: SystemTime::now(),
             llm_verified: false,
+            cache_type: self.config.cache_type.clone(),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -349,24 +357,8 @@ impl ResponseCache for RedisCache {
         }
 
         let mut conn = self.client.get_async_connection().await?;
-        let key = format!("{}:{}", self.config.prefix, prompt);
-        let entry = CacheEntry {
-            response,
-            created_at: SystemTime::now(),
-            expires_at: self.config.ttl.map(|ttl| SystemTime::now() + ttl),
-            embedding: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-            llm_verified: false,
-            checksum: None,
-            compressed_data: None,
-            original_size: None,
-            metadata: HashMap::new(),
-            chunks: None,
-            total_duration: None,
-            total_tokens: None,
-            is_streaming: false,
-        };
+        let key = self.build_key(prompt);
+        let entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
         let data = serde_json::to_string(&entry)?;
 
         if let Some(ttl) = self.config.ttl {
@@ -443,7 +435,7 @@ impl ResponseCache for RedisCache {
         }
 
         let mut conn = self.client.get_async_connection().await.ok()?;
-        let key = format!("{}:{}", self.config.prefix, prompt);
+        let key = self.build_key(prompt);
         let data: Option<String> = conn.get(&key).await.ok()?;
 
         if let Some(data) = data {
@@ -468,8 +460,8 @@ impl ResponseCache for RedisCache {
         }
 
         let mut conn = self.client.get_async_connection().await?;
-        let key = format!("{}:{}", self.config.prefix, prompt);
-        let entry = self.create_streaming_entry(chunks, self.config.stream_ttl);
+        let key = self.build_key(prompt);
+        let entry = CacheEntry::new_streaming(chunks, self.config.stream_ttl, Some(self.config.cache_type.clone()));
         let data = serde_json::to_string(&entry)?;
 
         if let Some(ttl) = self.config.stream_ttl {
@@ -480,5 +472,147 @@ impl ResponseCache for RedisCache {
 
         self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use futures::StreamExt;
+    use redis::RedisError;
+    use crate::llm::cache::config::{CacheBackend, RedisConfig};
+
+    fn create_test_config() -> CacheConfig {
+        CacheConfig {
+            enabled: true,
+            ttl: Some(Duration::from_secs(60)),
+            backend: CacheBackend::Redis(RedisConfig {
+                url: "redis://localhost".to_string(),
+                pool_size: 5,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redis_cache_types() {
+        let mut config = create_test_config();
+        let mut cache = match RedisCache::new(config.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test_redis_cache_types: {}", e);
+                return;
+            }
+        };
+
+        // Test Query type (default)
+        let response1 = LLMResponse {
+            text: "Query response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response1.clone()).await.unwrap();
+        
+        // Should find with same type
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Query response");
+
+        // Test Extract type
+        config.cache_type = CacheType::Extract;
+        cache.update_config(config.clone()).unwrap();
+        
+        let response2 = LLMResponse {
+            text: "Extract response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response2.clone()).await.unwrap();
+
+        // Should find Extract type response
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Extract response");
+
+        // Test Custom type
+        config.cache_type = CacheType::Custom("test_type".to_string());
+        cache.update_config(config).unwrap();
+        
+        let response3 = LLMResponse {
+            text: "Custom response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response3.clone()).await.unwrap();
+
+        // Should find Custom type response
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Custom response");
+
+        // Cleanup
+        cache.clear().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_redis_cache_type_streaming() {
+        let mut config = create_test_config();
+        config.stream_cache_enabled = true;
+        let mut cache = match RedisCache::new(config.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping test_redis_cache_type_streaming: {}", e);
+                return;
+            }
+        };
+
+        // Create test chunks
+        let chunks = vec![
+            StreamingResponse {
+                text: "Hello ".to_string(),
+                chunk_tokens: 1,
+                total_tokens: 2,
+                metadata: HashMap::new(),
+                timing: None,
+                done: false,
+            },
+            StreamingResponse {
+                text: "world!".to_string(),
+                chunk_tokens: 1,
+                total_tokens: 2,
+                metadata: HashMap::new(),
+                timing: None,
+                done: true,
+            },
+        ];
+
+        // Test with Query type (default)
+        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
+        let stream = cache.get_stream("test_prompt").await.unwrap();
+        let received_chunks: Vec<_> = stream.collect().await;
+        assert_eq!(received_chunks.len(), 2);
+        assert_eq!(received_chunks[0].as_ref().unwrap().text, "Hello ");
+
+        // Test with Extract type
+        config.cache_type = CacheType::Extract;
+        cache.update_config(config.clone()).unwrap();
+        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
+        let stream = cache.get_stream("test_prompt").await.unwrap();
+        let received_chunks: Vec<_> = stream.collect().await;
+        assert_eq!(received_chunks.len(), 2);
+        assert_eq!(received_chunks[1].as_ref().unwrap().text, "world!");
+
+        // Cleanup
+        cache.clear().await.unwrap();
     }
 } 

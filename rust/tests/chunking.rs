@@ -7,6 +7,7 @@ async fn test_basic_chunking() {
     let config = ChunkingConfig {
         max_token_size: 5,
         overlap_token_size: 2,
+        min_chunk_size: 1,
         ..Default::default()
     };
     let doc_id = compute_mdhash_id(content, "doc-");
@@ -23,6 +24,7 @@ async fn test_character_based_splitting() {
     let config = ChunkingConfig {
         split_by_character: Some("\n\n".to_string()),
         split_by_character_only: true,
+        min_chunk_size: 1,
         ..Default::default()
     };
     let doc_id = compute_mdhash_id(content, "doc-");

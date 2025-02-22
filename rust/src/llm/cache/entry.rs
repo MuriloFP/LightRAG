@@ -5,6 +5,7 @@ use crate::llm::LLMError;
 use crate::llm::LLMResponse;
 use crate::types::llm::StreamingResponse;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use super::types::CacheType;
 
 /// Entry in the cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +31,10 @@ pub struct CacheEntry {
 
     /// Whether this entry has been LLM verified
     pub llm_verified: bool,
+
+    /// Type of cached data
+    #[serde(default)]
+    pub cache_type: CacheType,
 
     /// Checksum for integrity validation
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +69,7 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     /// Create a new cache entry
-    pub fn new(response: LLMResponse, ttl: Option<Duration>) -> Self {
+    pub fn new(response: LLMResponse, ttl: Option<Duration>, cache_type: Option<CacheType>) -> Self {
         let now = SystemTime::now();
         Self {
             response,
@@ -74,6 +79,7 @@ impl CacheEntry {
             access_count: 0,
             last_accessed: now,
             llm_verified: false,
+            cache_type: cache_type.unwrap_or_default(),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -86,7 +92,7 @@ impl CacheEntry {
     }
 
     /// Create a new streaming cache entry
-    pub fn new_streaming(chunks: Vec<StreamingResponse>, ttl: Option<Duration>) -> Self {
+    pub fn new_streaming(chunks: Vec<StreamingResponse>, ttl: Option<Duration>, cache_type: Option<CacheType>) -> Self {
         let now = SystemTime::now();
         let total_text: String = chunks.iter().map(|c| c.text.clone()).collect();
         let total_tokens = chunks.iter().map(|c| c.chunk_tokens).sum();
@@ -115,6 +121,7 @@ impl CacheEntry {
             access_count: 0,
             last_accessed: now,
             llm_verified: false,
+            cache_type: cache_type.unwrap_or_default(),
             checksum: None,
             compressed_data: None,
             original_size: None,

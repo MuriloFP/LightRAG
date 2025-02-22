@@ -1,5 +1,6 @@
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use super::types::CacheType;
 
 /// Cache backend type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +77,10 @@ pub struct CacheConfig {
     /// Prefix for cache keys
     pub prefix: String,
 
+    /// Type of cached data
+    #[serde(default)]
+    pub cache_type: CacheType,
+
     /// Whether to use fuzzy matching for prompts
     pub use_fuzzy_match: bool,
 
@@ -145,6 +150,7 @@ impl Default for CacheConfig {
             compress_streams: false,
             stream_ttl: Some(Duration::from_secs(1800)), // 30 minutes
             prefix: "cache".to_string(),
+            cache_type: CacheType::default(),
             use_fuzzy_match: true,
             use_persistent: false,
             use_llm_verification: false,

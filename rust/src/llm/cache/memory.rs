@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use crate::llm::{LLMError, LLMResponse};
 use crate::types::llm::StreamingResponse;
 use super::{ResponseCache, CacheConfig, CacheEntry, CacheMetrics};
+use super::types::CacheType;
 
 /// In-memory implementation of ResponseCache
 pub struct InMemoryCache {
@@ -42,7 +43,7 @@ impl InMemoryCache {
     }
 
     /// Check if an entry is expired
-    fn is_expired(&self, entry: &CacheEntry) -> bool {
+    pub fn is_expired(&self, entry: &CacheEntry) -> bool {
         if let Some(expires_at) = entry.expires_at {
             SystemTime::now() > expires_at
         } else {
@@ -80,23 +81,51 @@ impl InMemoryCache {
         }
 
         let mut entries = self.entries.write().await;
-        let mut entry = CacheEntry::new(response, self.config.ttl);
+        let mut entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
         entry.embedding = Some(embedding);
         entries.insert(prompt.to_string(), entry);
         self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-}
 
-#[async_trait]
-impl ResponseCache for InMemoryCache {
-    async fn get(&self, prompt: &str) -> Option<LLMResponse> {
+    pub fn build_key(&self, prompt: &str) -> String {
+        format!("{}:{}:{}",
+            self.config.prefix,
+            self.config.cache_type.as_str(),
+            prompt
+        )
+    }
+
+    pub async fn put(&self, prompt: &str, response: LLMResponse) -> Result<(), LLMError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let key = self.build_key(prompt);
+        let mut entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
+        
+        if self.config.use_compression {
+            entry.compress()?;
+        }
+        
+        if self.config.validate_integrity {
+            entry.set_checksum()?;
+        }
+
+        let mut entries = self.entries.write().await;
+        entries.insert(key, entry);
+        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn get(&self, prompt: &str) -> Option<LLMResponse> {
         if !self.config.enabled {
             return None;
         }
 
+        let key = self.build_key(prompt);
         let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(prompt) {
+        if let Some(entry) = entries.get(&key) {
             if !self.is_expired(entry) {
                 self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(entry.response.clone());
@@ -106,25 +135,27 @@ impl ResponseCache for InMemoryCache {
         None
     }
 
-    async fn put(&self, prompt: &str, response: LLMResponse) -> Result<(), LLMError> {
-        if !self.config.enabled {
+    pub async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError> {
+        if !self.config.enabled || !self.config.stream_cache_enabled {
             return Ok(());
         }
 
+        let key = self.build_key(prompt);
+        let entry = CacheEntry::new_streaming(chunks, self.config.stream_ttl, Some(self.config.cache_type.clone()));
         let mut entries = self.entries.write().await;
-        let entry = CacheEntry::new(response, self.config.ttl);
-        entries.insert(prompt.to_string(), entry);
+        entries.insert(key, entry);
         self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>> {
+    pub async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>> {
         if !self.config.enabled || !self.config.stream_cache_enabled {
             return None;
         }
 
+        let key = self.build_key(prompt);
         let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(prompt) {
+        if let Some(entry) = entries.get(&key) {
             if !self.is_expired(entry) && entry.is_streaming() {
                 if let Some(chunks) = entry.get_chunks() {
                     self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -137,19 +168,7 @@ impl ResponseCache for InMemoryCache {
         None
     }
 
-    async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let mut entries = self.entries.write().await;
-        let entry = CacheEntry::new_streaming(chunks, self.config.ttl);
-        entries.insert(prompt.to_string(), entry);
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn cleanup(&self) -> Result<(), LLMError> {
+    pub async fn cleanup(&self) -> Result<(), LLMError> {
         let mut entries = self.entries.write().await;
         let before_len = entries.len();
         entries.retain(|_, entry| !self.is_expired(entry));
@@ -161,18 +180,18 @@ impl ResponseCache for InMemoryCache {
         Ok(())
     }
 
-    async fn clear(&self) -> Result<(), LLMError> {
+    pub async fn clear(&self) -> Result<(), LLMError> {
         let mut entries = self.entries.write().await;
         entries.clear();
         self.metrics.size.store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    fn get_config(&self) -> &CacheConfig {
+    pub fn get_config(&self) -> &CacheConfig {
         &self.config
     }
 
-    fn update_config(&mut self, config: CacheConfig) -> Result<(), LLMError> {
+    pub fn update_config(&mut self, config: CacheConfig) -> Result<(), LLMError> {
         self.config = config;
         Ok(())
     }
@@ -206,6 +225,144 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn test_cache_types() {
+        let mut config = CacheConfig {
+            enabled: true,
+            ttl: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let mut cache = InMemoryCache::new(config.clone());
+
+        // Test Query type (default)
+        let response1 = LLMResponse {
+            text: "Query response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response1.clone()).await.unwrap();
+        
+        // Should find with same type
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Query response");
+
+        // Test Extract type
+        config.cache_type = CacheType::Extract;
+        cache.update_config(config.clone()).unwrap();
+        
+        let response2 = LLMResponse {
+            text: "Extract response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response2.clone()).await.unwrap();
+
+        // Should not find Query type response
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Extract response");
+
+        // Test Keywords type
+        config.cache_type = CacheType::Keywords;
+        cache.update_config(config.clone()).unwrap();
+        
+        let response3 = LLMResponse {
+            text: "Keywords response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response3.clone()).await.unwrap();
+
+        // Should find Keywords type response
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Keywords response");
+
+        // Test Custom type
+        config.cache_type = CacheType::Custom("test_type".to_string());
+        cache.update_config(config).unwrap();
+        
+        let response4 = LLMResponse {
+            text: "Custom response".to_string(),
+            tokens_used: 2,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        };
+        cache.put("test_prompt", response4.clone()).await.unwrap();
+
+        // Should find Custom type response
+        let result = cache.get("test_prompt").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text, "Custom response");
+    }
+
+    #[tokio::test]
+    async fn test_cache_type_streaming() {
+        let mut config = CacheConfig {
+            enabled: true,
+            stream_cache_enabled: true,
+            ttl: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let mut cache = InMemoryCache::new(config.clone());
+
+        // Create test chunks
+        let chunks = vec![
+            StreamingResponse {
+                text: "Hello ".to_string(),
+                chunk_tokens: 1,
+                total_tokens: 2,
+                metadata: HashMap::new(),
+                timing: None,
+                done: false,
+            },
+            StreamingResponse {
+                text: "world!".to_string(),
+                chunk_tokens: 1,
+                total_tokens: 2,
+                metadata: HashMap::new(),
+                timing: None,
+                done: true,
+            },
+        ];
+
+        // Test with Query type (default)
+        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
+        let stream = cache.get_stream("test_prompt").await.unwrap();
+        let received_chunks: Vec<_> = stream.collect().await;
+        assert_eq!(received_chunks.len(), 2);
+        assert_eq!(received_chunks[0].as_ref().unwrap().text, "Hello ");
+
+        // Test with Extract type
+        config.cache_type = CacheType::Extract;
+        cache.update_config(config.clone()).unwrap();
+        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
+        let stream = cache.get_stream("test_prompt").await.unwrap();
+        let received_chunks: Vec<_> = stream.collect().await;
+        assert_eq!(received_chunks.len(), 2);
+        assert_eq!(received_chunks[1].as_ref().unwrap().text, "world!");
+
+        // Test with Custom type
+        config.cache_type = CacheType::Custom("streaming_test".to_string());
+        cache.update_config(config).unwrap();
+        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
+        let stream = cache.get_stream("test_prompt").await.unwrap();
+        let received_chunks: Vec<_> = stream.collect().await;
+        assert_eq!(received_chunks.len(), 2);
+    }
 
     #[tokio::test]
     async fn test_streaming_cache() {
@@ -253,7 +410,8 @@ mod tests {
         let config = CacheConfig {
             enabled: true,
             stream_cache_enabled: true,
-            ttl: Some(Duration::from_millis(100)), // Very short TTL
+            ttl: Some(Duration::from_millis(100)), // Very short TTL for normal entries
+            stream_ttl: Some(Duration::from_millis(100)), // Very short TTL for streaming entries
             ..Default::default()
         };
         let cache = InMemoryCache::new(config);

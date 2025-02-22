@@ -197,6 +197,11 @@ impl NanoVectorStorage {
         hnsw.batch_size = batch_size;
         hnsw.sync_threshold = sync_threshold;
         
+        // If a dimension is provided in config.extra_config under the key "dim", set it for the HNSW index
+        if let Some(dim) = config.get_usize("dim") {
+            hnsw.set_dimension(dim);
+        }
+        
         // Set up persistence paths
         let storage_path = config.working_dir.join("vector_storage.json");
         
@@ -227,7 +232,13 @@ impl NanoVectorStorage {
         if self.storage_path.exists() {
             let content = fs::read_to_string(&self.storage_path)?;
             if !content.trim().is_empty() {
-                self.storage = serde_json::from_str(&content)?;
+                let loaded: Vec<VectorData> = serde_json::from_str(&content)?;
+                
+                // Normalize all vectors before storing
+                self.storage = loaded.into_iter().map(|mut v| {
+                    Self::normalize_vector(&mut v.vector);
+                    v
+                }).collect();
             }
         }
         Ok(())
@@ -363,12 +374,38 @@ impl NanoVectorStorage {
 #[async_trait]
 impl VectorStorage for NanoVectorStorage {
     async fn initialize(&mut self) -> Result<()> {
-        // Load both HNSW index and vector storage from files
-        self.hnsw.load()?;
+        tracing::debug!("Initializing NanoVectorStorage");
+        // Load storage first to get dimension
         self.load_storage()?;
-        
+        tracing::debug!("Loaded {} vectors from storage", self.storage.len());
+
+        // Set dimension in HNSW index if we have vectors
+        if let Some(first) = self.storage.first() {
+            let dim = first.vector.len();
+            tracing::debug!("Setting HNSW dimension to {}", dim);
+            self.hnsw.set_dimension(dim);
+        }
+
+        // Now load HNSW index
+        self.hnsw.load()?;
+        tracing::debug!("Loaded HNSW index with {} nodes", self.hnsw.nodes.len());
+
+        // If the HNSW index is empty but we have stored vectors, rebuild the index
+        if self.hnsw.nodes.is_empty() && !self.storage.is_empty() {
+            tracing::debug!("Rebuilding HNSW index from {} stored vectors", self.storage.len());
+            // Add all vectors to the index
+            for vector_data in &self.storage {
+                let mut normalized_vector = vector_data.vector.clone();
+                Self::normalize_vector(&mut normalized_vector);
+                let node = hnsw::HNSWNode::new(&vector_data.id, normalized_vector);
+                self.hnsw.add_node(node)?;
+            }
+            tracing::debug!("Finished rebuilding HNSW index");
+        }
+
         // Initialize vector optimization with loaded data
         self.initialize_optimization()?;
+        tracing::debug!("Vector storage initialization complete");
         
         Ok(())
     }
@@ -381,18 +418,14 @@ impl VectorStorage for NanoVectorStorage {
     }
 
     async fn query(&self, mut query: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>> {
+        tracing::debug!("Querying vector storage with top_k={}", top_k);
         // Normalize the query vector
         Self::normalize_vector(&mut query);
-
-        // Optimize query vector if optimizer is available
-        let optimized_query = if let Some(optimizer) = &self.optimizer {
-            Some(optimizer.optimize_query(&query)?)
-        } else {
-            None
-        };
+        tracing::debug!("Normalized query vector: {:?}", query);
 
         // Use the HNSW index for querying with proper ef_search parameter
         let hnsw_results = self.hnsw.query(query.as_slice(), top_k, 128)?;
+        tracing::debug!("HNSW returned {} results", hnsw_results.len());
         
         // Map all candidates to SearchResult format
         let mut candidates: Vec<SearchResult> = hnsw_results.into_iter().map(|(id, sim)| {
@@ -401,101 +434,68 @@ impl VectorStorage for NanoVectorStorage {
                 .find(|v| v.id == id)
                 .unwrap();
             
-            // If both query and stored vector are optimized, use optimized similarity
-            let distance = if let (Some(opt_query), Some(opt_stored)) = (&optimized_query, &vector_data.optimized) {
-                // Use the most efficient representation for comparison
-                let query_data = opt_query.get_best_representation();
-                let stored_data = opt_stored.get_best_representation();
-                
-                if query_data.len() == stored_data.len() {
-                    // Compute similarity using optimized representations
-                    let similarity: f32 = query_data.iter()
-                        .zip(stored_data.iter())
-                        .map(|(&a, &b)| (a as f32 - b as f32).powi(2))
-                        .sum::<f32>()
-                        .sqrt();
-                    1.0 / (1.0 + similarity)
-                } else {
-                    sim // Fallback to original similarity
-                }
-            } else {
-                sim
-            };
-            
             SearchResult {
-                id,
-                distance,
+                id: id.clone(),
+                distance: sim,
                 metadata: vector_data.metadata.clone(),
             }
         }).collect();
 
         // Sort candidates by descending similarity
         candidates.sort_by(|a, b| b.distance.partial_cmp(&a.distance).unwrap());
+        tracing::debug!("Found {} candidates before filtering", candidates.len());
 
         // If a threshold is set, filter the candidates strictly
         if self.threshold > 0.0 {
             let filtered: Vec<SearchResult> = candidates.into_iter().filter(|r| r.distance >= self.threshold).collect();
+            tracing::debug!("Filtered to {} results with threshold {}", filtered.len(), self.threshold);
             Ok(filtered.into_iter().take(top_k).collect())
         } else {
-            Ok(candidates.into_iter().take(top_k).collect())
+            let len = candidates.len();
+            let results = candidates.into_iter().take(top_k).collect();
+            tracing::debug!("Returning {} results from {} candidates", top_k, len);
+            Ok(results)
         }
     }
 
     async fn upsert(&mut self, data: Vec<VectorData>) -> Result<UpsertResponse> {
+        tracing::debug!("Upserting {} vectors", data.len());
         let mut inserted = Vec::new();
         let mut updated = Vec::new();
 
         // Process in batches
         for chunk in data.chunks(self.max_batch_size) {
+            tracing::debug!("Processing batch of {} vectors", chunk.len());
             for mut vector_data in chunk.to_vec() {
                 // Set creation time for new vectors
-                if !self.storage.iter().any(|v| v.id == vector_data.id) {
+                let is_new = !self.storage.iter().any(|v| v.id == vector_data.id);
+                if is_new {
                     vector_data.created_at = std::time::SystemTime::now();
                 }
                 
                 // Normalize the vector
                 Self::normalize_vector(&mut vector_data.vector);
-
-                // Apply vector optimization if enabled
-                if let Some(optimizer) = &mut self.optimizer {
-                    let optimized = optimizer.optimize(&vector_data.vector)?;
-                    
-                    // Add optimization metadata
-                    let mut metadata = vector_data.metadata.clone();
-                    if let Some(ratio) = optimized.compression_ratio {
-                        metadata.insert("compression_ratio".to_string(), Value::from(ratio));
-                    }
-                    if let Some(error) = optimized.pq_error.or(optimized.sq_error) {
-                        metadata.insert("quantization_error".to_string(), Value::from(error));
-                    }
-                    vector_data.metadata = metadata;
-                    
-                    // Store optimized vector data
-                    vector_data.optimized = Some(optimized);
-                }
+                tracing::debug!("Normalized vector for {}: {:?}", vector_data.id, vector_data.vector);
 
                 let mut exists = false;
                 for existing in &mut self.storage {
                     if existing.id == vector_data.id {
-                        // Preserve creation time for updates
                         let created_at = existing.created_at;
                         *existing = vector_data.clone();
                         existing.created_at = created_at;
                         updated.push(existing.id.clone());
                         exists = true;
-
-                        // Update corresponding HNSW node
-                        for node in self.hnsw.nodes.iter_mut() {
-                            if node.id == vector_data.id {
-                                node.vector = vector_data.vector.clone();
-                                break;
-                            }
-                        }
+                        tracing::debug!("Updating existing vector {}", vector_data.id);
+                        // Instead of directly updating the HNSW node, remove and re-add it to update connections
+                        self.hnsw.delete_nodes(&[vector_data.id.clone()]);
+                        let new_node = hnsw::HNSWNode::new(&vector_data.id, vector_data.vector.clone());
+                        self.hnsw.add_node(new_node)?;
                         break;
                     }
                 }
 
                 if !exists {
+                    tracing::debug!("Inserting new vector {}", vector_data.id);
                     // Create HNSW node and add to index
                     let node = hnsw::HNSWNode::new(&vector_data.id, vector_data.vector.clone());
                     self.hnsw.add_node(node)?;
@@ -506,6 +506,7 @@ impl VectorStorage for NanoVectorStorage {
             }
         }
 
+        tracing::debug!("Upsert complete: {} inserted, {} updated", inserted.len(), updated.len());
         // Save changes to disk with lock
         let _guard = self.save_lock.lock().await;
         self.save_storage()?;

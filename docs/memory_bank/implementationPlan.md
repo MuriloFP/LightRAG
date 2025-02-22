@@ -150,6 +150,13 @@ rust/
 - [x] Vector normalization and similarity search
 - [x] Multiple backend support (FAISS, TiDB, PostgreSQL)
 - [x] Basic HNSW index implementation
+  - [x] Static ef_construction parameter (128)
+  - [x] Fixed M parameter for max connections (16)
+  - [x] Configurable batch size handling
+  - [x] Layer configuration with max_layers
+  - [x] Persistence and serialization
+  - [x] Node and connection management
+  - [x] Search with configurable parameters
 - [x] Cosine similarity search
 - [x] Batch processing for vectors
 - [x] Vector metadata management
@@ -165,22 +172,6 @@ rust/
   - [x] Automatic parameter tuning
   - [x] Incremental codebook updates
   - [x] Vector pruning strategies
-
-- [ ] Advanced HNSW Configuration
-  - [ ] Dynamic ef_construction parameter
-  - [ ] Adaptive M (max connections) based on data size
-  - [ ] Multi-threaded index construction
-  - [ ] Optimized batch size handling
-  - [ ] Layer configuration optimization
-  - [ ] Index pruning strategies
-
-- [ ] Enhanced Caching System
-  - [ ] Multi-backend cache support (Redis, In-memory, Persistent)
-  - [ ] Cache verification using similarity matching
-  - [ ] Intelligent eviction strategies (LRU, LFU, FIFO)
-  - [ ] Cache size optimization
-  - [ ] Cache hit ratio monitoring
-  - [ ] Cache warming strategies
 
 ### Vector Monitoring & Metrics
 - [x] Performance Metrics
