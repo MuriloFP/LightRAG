@@ -16,5 +16,34 @@ pub mod openai;
 /// - Local inference
 pub mod ollama;
 
+/// Anthropic API client implementation.
+///
+/// Provides integration with Anthropic's Claude models through their REST API.
+/// Supports:
+/// - Text completion
+/// - Response streaming
+/// - System prompts
+pub mod anthropic;
+
+/// LiteLLM proxy client implementation.
+///
+/// Provides unified interface for multiple LLM providers.
+/// Supports:
+/// - Multiple provider routing
+/// - Unified configuration
+/// - Provider fallbacks
+/// - Consistent API interface
+pub mod litellm;
+
 pub use openai::OpenAIClient;
-pub use ollama::OllamaClient; 
+pub use ollama::OllamaClient;
+pub use anthropic::AnthropicClient;
+pub use litellm::{
+    LiteLLMClient,
+    LiteLLMConfig,
+    LLMProvider,
+    ProviderAdapter,
+    ProviderConfig,
+    OpenAIAdapter,
+    AnthropicAdapter,
+}; 

@@ -33,6 +33,7 @@ async fn test_openai_streaming() {
         system_prompt: None,
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let result = client.generate_stream("Test prompt", &params).await;
@@ -99,6 +100,7 @@ async fn test_ollama_streaming() {
         system_prompt: None,
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let stream = client.generate_stream("Test prompt", &params).await;
@@ -188,6 +190,7 @@ async fn test_streaming_cancellation() {
         system_prompt: None,
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let stream = client.generate_stream("Write a long story about an adventure", &params).await;
@@ -263,6 +266,7 @@ async fn test_streaming_timeout() {
         system_prompt: None,
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let result = client.generate_stream("Test prompt", &params).await;

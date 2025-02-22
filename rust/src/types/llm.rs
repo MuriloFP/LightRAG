@@ -136,6 +136,9 @@ pub enum LLMError {
 /// Parameters for LLM requests
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMParams {
+    /// Model identifier (e.g. "openai/gpt-4", "anthropic/claude-2")
+    pub model: String,
+
     /// Maximum number of tokens to generate
     pub max_tokens: usize,
 
@@ -161,6 +164,7 @@ pub struct LLMParams {
 impl Default for LLMParams {
     fn default() -> Self {
         Self {
+            model: "openai/gpt-4".to_string(),
             max_tokens: 1000,
             temperature: 0.7,
             top_p: 1.0,

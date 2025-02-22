@@ -44,6 +44,7 @@ impl Default for LLMSummaryConfig {
         Self {
             base_config: SummaryConfig::default(),
             llm_params: LLMParams {
+                model: "openai/gpt-4".to_string(),
                 max_tokens: 500,
                 temperature: 0.3,
                 top_p: 0.9,

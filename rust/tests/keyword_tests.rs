@@ -108,7 +108,7 @@ impl LLMClient for MockLLMClient {
                 "low_level_keywords": ["detail1", "detail2"]
             }"#.to_string(),
             tokens_used: 10,
-            model: "mock-model".to_string(),
+            model: "openai/gpt-4".to_string(),
             cached: false,
             context: None,
             metadata: HashMap::new(),
@@ -156,6 +156,7 @@ async fn test_llm_keyword_extraction() {
         system_prompt: Some("Extract keywords from the text.".to_string()),
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let extractor = LLMKeywordExtractor::new(config, llm_client, llm_params);
@@ -186,6 +187,7 @@ async fn test_keyword_extraction_with_history() {
         system_prompt: Some("Extract keywords considering conversation history.".to_string()),
         query_params: None,
         extra_params: HashMap::new(),
+        model: "openai/gpt-4".to_string(),
     };
 
     let extractor = LLMKeywordExtractor::new(config, llm_client, llm_params);
