@@ -74,7 +74,7 @@ async fn test_redis_cache() {
 
 #[tokio::test]
 async fn test_redis_cache_expiration() {
-    let mut config = CacheConfig {
+    let config = CacheConfig {
         enabled: true,
         max_entries: Some(10000),
         ttl: Some(std::time::Duration::from_secs(1)),
@@ -121,7 +121,7 @@ async fn test_redis_cache_expiration() {
 
 #[tokio::test]
 async fn test_redis_cache_similarity_search() {
-    let mut config = CacheConfig {
+    let config = CacheConfig {
         enabled: true,
         max_entries: Some(10000),
         ttl: Some(std::time::Duration::from_secs(3600)),

@@ -132,13 +132,18 @@ impl DocumentProcessor {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Check if content is duplicate
+    /// Check if content is duplicate, normalizing content first
     pub async fn is_duplicate(&self, content: &str) -> Result<bool, DocumentError> {
         if !self.config.enable_deduplication {
             return Ok(false);
         }
 
-        let doc_id = self.generate_doc_id(content);
+        let normalized_content = content.trim();
+        if normalized_content.is_empty() {
+            return Ok(false);
+        }
+
+        let doc_id = self.generate_doc_id(normalized_content);
         let store = self.status_store.read().await;
         Ok(store.contains_key(&doc_id))
     }
@@ -250,68 +255,59 @@ impl DocumentProcessor {
         Ok((summary, keywords))
     }
 
-    /// Process multiple documents in batch
+    /// Process multiple documents in batch with efficient deduplication
     pub async fn process_batch(&self, documents: Vec<String>) -> Result<Vec<String>, DocumentError> {
         if documents.is_empty() {
             return Ok(vec![]);
         }
 
-        let batch_size = documents.len().min(self.config.max_batch_size);
+        // Normalize and deduplicate content
+        let unique_contents: std::collections::HashSet<_> = documents
+            .iter()
+            .map(|doc| doc.trim())
+            .filter(|doc| !doc.is_empty())
+            .collect();
+
+        // Generate IDs for unique content
+        let mut new_docs: Vec<(String, String)> = unique_contents
+            .iter()
+            .map(|content| (self.generate_doc_id(content), content.to_string()))
+            .collect();
+
+        // Filter out already processed documents
+        let store = self.status_store.read().await;
+        new_docs.retain(|(id, _)| !store.contains_key(id));
+        drop(store);
+
+        let batch_size = new_docs.len().min(self.config.max_batch_size);
         let mut results = Vec::with_capacity(batch_size);
 
-        if self.config.parallel_processing {
-            let mut tasks = Vec::with_capacity(batch_size);
-            for doc in documents {
-                let summarizer = Arc::clone(&self.summarizer);
-                let keyword_extractor = Arc::clone(&self.keyword_extractor);
-                let status_store = Arc::clone(&self.status_store);
-                let config = self.config.clone();
-                
-                tasks.push(tokio::spawn(async move {
-                    let processor = DocumentProcessor {
-                        config,
-                        summarizer,
-                        keyword_extractor,
-                        status_store,
-                    };
-                    processor.process_document(&doc).await
-                }));
-            }
-
-            for task in tasks {
-                match task.await {
-                    Ok(result) => results.push(result?),
-                    Err(e) => return Err(DocumentError::ProcessingError(e.to_string())),
+        for (doc_id, content) in new_docs {
+            match self.process_document(&content).await {
+                Ok(_) => results.push(doc_id),
+                Err(e) => {
+                    tracing::error!("Failed to process document {}: {}", doc_id, e);
+                    continue;
                 }
-            }
-        } else {
-            for doc in documents {
-                results.push(self.process_document(&doc).await?);
             }
         }
 
         Ok(results)
     }
 
-    /// Get status counts
-    pub async fn get_status_counts(&self) -> HashMap<DocumentStatus, usize> {
-        let store = self.status_store.read().await;
-        let mut counts = HashMap::new();
-        
-        for status in store.values() {
-            *counts.entry(status.status).or_insert(0) += 1;
-        }
-        
-        counts
+    /// Get document status
+    pub async fn get_document_status(&self, doc_id: &str) -> Option<DocumentStatus> {
+        self.status_store.read().await
+            .get(doc_id)
+            .map(|status| status.status)
     }
 
-    /// Get documents by status
-    pub async fn get_docs_by_status(&self, status: DocumentStatus) -> Vec<(String, DocumentProcessingStatus)> {
-        let store = self.status_store.read().await;
-        store
+    /// Get all document IDs by status
+    pub async fn get_documents_by_status(&self, status: DocumentStatus) -> Vec<String> {
+        self.status_store.read().await
             .iter()
-            .filter(|(_, doc)| doc.status == status)
-            .map(|(id, status)| (id.clone(), status.clone()))
+            .filter(|(_, doc_status)| doc_status.status == status)
+            .map(|(id, _)| id.clone())
             .collect()
     }
 }
@@ -429,7 +425,7 @@ mod tests {
         
         assert_eq!(doc_id1, doc_id2);
         
-        let counts = processor.get_status_counts().await;
-        assert_eq!(counts.get(&DocumentStatus::Completed), Some(&1));
+        let counts = processor.get_documents_by_status(DocumentStatus::Completed).await;
+        assert_eq!(counts.len(), 1);
     }
 } 

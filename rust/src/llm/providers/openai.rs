@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::llm::{

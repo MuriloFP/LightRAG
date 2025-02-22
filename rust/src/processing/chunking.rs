@@ -1,6 +1,8 @@
 use crate::processing::types::{TextChunk, ChunkingError};
 use tiktoken_rs::cl100k_base;
-use tracing::debug;
+use tracing::{debug, warn};
+use std::collections::HashSet;
+use regex::Regex;
 
 /// Configuration for text chunking
 #[derive(Debug, Clone)]
@@ -13,6 +15,14 @@ pub struct ChunkingConfig {
     pub split_by_character: Option<String>,
     /// Whether to only use character splitting without token-based chunking
     pub split_by_character_only: bool,
+    /// Minimum chunk size in tokens
+    pub min_chunk_size: usize,
+    /// Whether to enable smart boundary detection
+    pub smart_boundary: bool,
+    /// Whether to enable chunk deduplication
+    pub enable_deduplication: bool,
+    /// Minimum similarity threshold for deduplication (0.0-1.0)
+    pub dedup_similarity_threshold: f32,
 }
 
 impl Default for ChunkingConfig {
@@ -22,6 +32,10 @@ impl Default for ChunkingConfig {
             max_token_size: 1200,
             split_by_character: None,
             split_by_character_only: false,
+            min_chunk_size: 50,
+            smart_boundary: true,
+            enable_deduplication: true,
+            dedup_similarity_threshold: 0.85,
         }
     }
 }
@@ -58,12 +72,14 @@ pub async fn chunk_text(
                 let chunk_content = chunk.trim();
                 if !chunk_content.is_empty() {
                     let tokens = bpe.encode_with_special_tokens(chunk_content);
-                    chunks.push(TextChunk {
-                        tokens: tokens.len(),
-                        content: chunk_content.to_string(),
-                        full_doc_id: doc_id.to_string(),
-                        chunk_order_index: idx,
-                    });
+                    if tokens.len() >= config.min_chunk_size {
+                        chunks.push(TextChunk {
+                            tokens: tokens.len(),
+                            content: chunk_content.to_string(),
+                            full_doc_id: doc_id.to_string(),
+                            chunk_order_index: idx,
+                        });
+                    }
                 }
             }
         } else {
@@ -80,8 +96,7 @@ pub async fn chunk_text(
                     let sub_chunks = split_by_tokens(
                         chunk_content,
                         &bpe,
-                        config.max_token_size,
-                        config.overlap_token_size,
+                        config,
                     )?;
                     
                     for (sub_idx, sub_chunk) in sub_chunks.into_iter().enumerate() {
@@ -92,7 +107,7 @@ pub async fn chunk_text(
                             chunk_order_index: idx * 1000 + sub_idx, // Preserve order with sub-indexing
                         });
                     }
-                } else {
+                } else if tokens.len() >= config.min_chunk_size {
                     chunks.push(TextChunk {
                         tokens: tokens.len(),
                         content: chunk_content.to_string(),
@@ -107,8 +122,7 @@ pub async fn chunk_text(
         chunks = split_by_tokens(
             content,
             &bpe,
-            config.max_token_size,
-            config.overlap_token_size,
+            config,
         )?;
         
         // Set chunk order and document ID
@@ -117,6 +131,9 @@ pub async fn chunk_text(
             chunk.full_doc_id = doc_id.to_string();
         }
     }
+
+    // Validate and deduplicate chunks
+    chunks = validate_and_deduplicate_chunks(chunks, config)?;
 
     debug!(
         "Created {} chunks from document {}",
@@ -127,35 +144,145 @@ pub async fn chunk_text(
     Ok(chunks)
 }
 
-/// Helper function to split text by tokens
+/// Helper function to split text by tokens with smart boundary detection
 fn split_by_tokens(
     content: &str,
     bpe: &tiktoken_rs::CoreBPE,
-    max_token_size: usize,
-    overlap_token_size: usize,
+    config: &ChunkingConfig,
 ) -> Result<Vec<TextChunk>, ChunkingError> {
     let tokens = bpe.encode_with_special_tokens(content);
     let mut chunks = Vec::new();
     
+    // Compile regex patterns for smart boundary detection
+    let sentence_end = Regex::new(r"[.!?]\s+").unwrap();
+    let paragraph_end = Regex::new(r"\n\s*\n").unwrap();
+    
     // Calculate chunk positions
-    for start in (0..tokens.len()).step_by(max_token_size - overlap_token_size) {
-        let end = (start + max_token_size).min(tokens.len());
-        let chunk_tokens = &tokens[start..end];
+    let mut start = 0;
+    while start < tokens.len() {
+        let mut end = (start + config.max_token_size).min(tokens.len());
         
+        // Smart boundary detection if enabled
+        if config.smart_boundary && end < tokens.len() {
+            let chunk_text = bpe.decode(tokens[start..end].to_vec())
+                .map_err(|e| ChunkingError::TokenizationError(e.to_string()))?;
+                
+            // Try to find a paragraph boundary
+            if let Some(para_match) = paragraph_end.find_iter(&chunk_text).last() {
+                end = start + bpe.encode_with_special_tokens(&chunk_text[..para_match.end()]).len();
+            } else if let Some(sent_match) = sentence_end.find_iter(&chunk_text).last() {
+                // Fall back to sentence boundary
+                end = start + bpe.encode_with_special_tokens(&chunk_text[..sent_match.end()]).len();
+            }
+        }
+        // Safeguard to ensure progress and avoid infinite loop
+        if end <= start {
+            end = (start + config.max_token_size).min(tokens.len());
+            if end <= start {
+                end = start + 1;
+            }
+        }
+        
+        let chunk_tokens = &tokens[start..end];
         let chunk_content = bpe.decode(chunk_tokens.to_vec())
             .map_err(|e| ChunkingError::TokenizationError(e.to_string()))?;
             
-        chunks.push(TextChunk {
-            tokens: chunk_tokens.len(),
-            content: chunk_content,
-            full_doc_id: String::new(), // Will be set by caller
-            chunk_order_index: 0, // Will be set by caller
-        });
-
-        if end == tokens.len() {
-            break;
+        // Only add chunk if it meets minimum size requirement
+        if chunk_tokens.len() >= config.min_chunk_size {
+            chunks.push(TextChunk {
+                tokens: chunk_tokens.len(),
+                content: chunk_content,
+                full_doc_id: String::new(), // Will be set by caller
+                chunk_order_index: 0, // Will be set by caller
+            });
         }
+    
+        // Calculate next start position with overlap, ensuring progress
+        start = if end == tokens.len() {
+            end // No more tokens to process
+        } else {
+            std::cmp::max(end - config.overlap_token_size, start + 1)
+        };
     }
 
     Ok(chunks)
+}
+
+/// Validate chunks and remove duplicates
+fn validate_and_deduplicate_chunks(
+    mut chunks: Vec<TextChunk>,
+    config: &ChunkingConfig,
+) -> Result<Vec<TextChunk>, ChunkingError> {
+    // Remove chunks that are too small
+    chunks.retain(|chunk| chunk.tokens >= config.min_chunk_size);
+    
+    if chunks.is_empty() {
+        return Err(ChunkingError::ProcessingError("No valid chunks created".to_string()));
+    }
+    
+    // Deduplicate chunks if enabled
+    if config.enable_deduplication {
+        let mut unique_chunks = Vec::new();
+        let mut seen_content = HashSet::new();
+        
+        for chunk in chunks {
+            // Calculate normalized content for comparison
+            let normalized = chunk.content.to_lowercase();
+            
+            // Check if this is a duplicate
+            if !seen_content.contains(&normalized) {
+                seen_content.insert(normalized);
+                unique_chunks.push(chunk);
+            } else {
+                warn!("Removed duplicate chunk at index {}", chunk.chunk_order_index);
+            }
+        }
+        
+        chunks = unique_chunks;
+    }
+    
+    Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_chunk_text_with_smart_boundary() {
+        let config = ChunkingConfig {
+            max_token_size: 100,
+            overlap_token_size: 20,
+            smart_boundary: true,
+            split_by_character: Some("\n\n".to_string()),
+            min_chunk_size: 1,
+            ..Default::default()
+        };
+        
+        let text = "This is sentence one. This is sentence two.\n\nThis is a new paragraph. And another sentence.\n\nFinal paragraph here.";
+        let chunks = chunk_text(text, &config, "test-doc").await.unwrap();
+        
+        assert!(chunks.len() > 0);
+        // Verify chunks end at sentence or paragraph boundaries
+        for chunk in chunks {
+            assert!(chunk.content.ends_with('.') || chunk.content.ends_with('\n'));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chunk_deduplication() {
+        let config = ChunkingConfig {
+            enable_deduplication: true,
+            dedup_similarity_threshold: 0.85,
+            split_by_character: Some("\n".to_string()),
+            min_chunk_size: 1,
+            ..Default::default()
+        };
+        
+        let text = "Duplicate text here.\nDuplicate text here.\nUnique text.\nDuplicate text here.";
+        let chunks = chunk_text(text, &config, "test-doc").await.unwrap();
+        
+        // Should only have two chunks after deduplication
+        assert_eq!(chunks.len(), 2);
+    }
 } 

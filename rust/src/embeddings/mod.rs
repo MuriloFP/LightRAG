@@ -1,4 +1,3 @@
-use crate::types::embeddings::EmbeddingProvider;
 
 /// OpenAI embeddings provider implementation
 pub mod openai;

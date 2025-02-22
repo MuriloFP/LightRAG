@@ -22,6 +22,9 @@
 /// - Persistence capabilities
 pub mod hnsw;
 
+pub mod optimization;
+pub use optimization::{OptimizationConfig, OptimizationStats, VectorOptimizer, OptimizedVector};
+
 use crate::types::Result;
 use crate::types::Error;
 use crate::utils::compute_mdhash_id;
@@ -100,6 +103,9 @@ pub struct VectorData {
     /// Creation timestamp
     #[serde(default = "std::time::SystemTime::now")]
     pub created_at: std::time::SystemTime,
+    /// Optimized vector data if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimized: Option<OptimizedVector>,
 }
 
 /// Data structure for query results.
@@ -138,6 +144,8 @@ pub struct NanoVectorStorage {
     max_batch_size: usize,
     /// Lock for file operations
     save_lock: tokio::sync::Mutex<()>,
+    /// Vector optimizer for compression and quantization
+    optimizer: Option<VectorOptimizer>,
 }
 
 impl NanoVectorStorage {
@@ -156,12 +164,31 @@ impl NanoVectorStorage {
         let batch_size = config.get_usize("vector_db_storage.hnsw.batch_size").unwrap_or(100);
         let sync_threshold = config.get_usize("vector_db_storage.hnsw.sync_threshold").unwrap_or(1000);
         
+        // Get optimization parameters from config
+        let use_optimization = config.get_bool("vector_db_storage.optimization.enabled").unwrap_or(true);
+        let optimizer = if use_optimization {
+            let opt_config = OptimizationConfig {
+                use_pq: config.get_bool("vector_db_storage.optimization.use_pq").unwrap_or(true),
+                pq_segments: config.get_usize("vector_db_storage.optimization.pq_segments").unwrap_or(8),
+                pq_bits: config.get_u8("vector_db_storage.optimization.pq_bits").unwrap_or(8),
+                use_sq: config.get_bool("vector_db_storage.optimization.use_sq").unwrap_or(true),
+                sq_bits: config.get_u8("vector_db_storage.optimization.sq_bits").unwrap_or(8),
+                use_compression: config.get_bool("vector_db_storage.optimization.use_compression").unwrap_or(true),
+                compression_ratio: config.get_f32("vector_db_storage.optimization.compression_ratio").unwrap_or(0.5),
+                max_error: config.get_f32("vector_db_storage.optimization.max_error").unwrap_or(0.01),
+            };
+            Some(VectorOptimizer::new(opt_config))
+        } else {
+            None
+        };
+        
         tracing::info!(
             threshold = threshold,
             batch_size = max_batch_size,
             max_layers = max_layers,
             ef_construction = ef_construction,
             m = m,
+            use_optimization = use_optimization,
             "Initializing NanoVectorStorage"
         );
         
@@ -188,6 +215,7 @@ impl NanoVectorStorage {
             storage_path,
             max_batch_size,
             save_lock: tokio::sync::Mutex::new(()),
+            optimizer,
         })
     }
 
@@ -294,6 +322,42 @@ impl NanoVectorStorage {
         }
         Ok(())
     }
+
+    /// Initializes vector optimization with training data.
+    pub fn initialize_optimization(&mut self) -> Result<()> {
+        if let Some(optimizer) = &mut self.optimizer {
+            let training_vectors: Vec<Vec<f32>> = self.storage.iter()
+                .map(|v| v.vector.clone())
+                .collect();
+            
+            if !training_vectors.is_empty() {
+                optimizer.initialize(&training_vectors)?;
+                tracing::info!("Vector optimization initialized with {} training vectors", training_vectors.len());
+            }
+        }
+        Ok(())
+    }
+
+    /// Gets optimization statistics.
+    pub fn get_optimization_stats(&self) -> Option<&OptimizationStats> {
+        self.optimizer.as_ref().map(|opt| opt.get_stats())
+    }
+
+    /// Creates a new instance for testing with optional optimization
+    #[cfg(test)]
+    pub fn new_for_testing(opt_config: Option<OptimizationConfig>) -> Result<Self> {
+        use std::env::temp_dir;
+        
+        let mut config = crate::types::Config::default();
+        config.working_dir = temp_dir();
+        
+        let mut storage = Self::new(&config)?;
+        if let Some(opt_config) = opt_config {
+            storage.optimizer = Some(VectorOptimizer::new(opt_config));
+        }
+        
+        Ok(storage)
+    }
 }
 
 #[async_trait]
@@ -302,6 +366,10 @@ impl VectorStorage for NanoVectorStorage {
         // Load both HNSW index and vector storage from files
         self.hnsw.load()?;
         self.load_storage()?;
+        
+        // Initialize vector optimization with loaded data
+        self.initialize_optimization()?;
+        
         Ok(())
     }
 
@@ -316,17 +384,49 @@ impl VectorStorage for NanoVectorStorage {
         // Normalize the query vector
         Self::normalize_vector(&mut query);
 
+        // Optimize query vector if optimizer is available
+        let optimized_query = if let Some(optimizer) = &self.optimizer {
+            Some(optimizer.optimize_query(&query)?)
+        } else {
+            None
+        };
+
         // Use the HNSW index for querying with proper ef_search parameter
         let hnsw_results = self.hnsw.query(query.as_slice(), top_k, 128)?;
         
         // Map all candidates to SearchResult format
         let mut candidates: Vec<SearchResult> = hnsw_results.into_iter().map(|(id, sim)| {
-            let metadata = self.storage
+            let vector_data = self.storage
                 .iter()
                 .find(|v| v.id == id)
-                .map(|v| v.metadata.clone())
-                .unwrap_or_default();
-            SearchResult { id, distance: sim, metadata }
+                .unwrap();
+            
+            // If both query and stored vector are optimized, use optimized similarity
+            let distance = if let (Some(opt_query), Some(opt_stored)) = (&optimized_query, &vector_data.optimized) {
+                // Use the most efficient representation for comparison
+                let query_data = opt_query.get_best_representation();
+                let stored_data = opt_stored.get_best_representation();
+                
+                if query_data.len() == stored_data.len() {
+                    // Compute similarity using optimized representations
+                    let similarity: f32 = query_data.iter()
+                        .zip(stored_data.iter())
+                        .map(|(&a, &b)| (a as f32 - b as f32).powi(2))
+                        .sum::<f32>()
+                        .sqrt();
+                    1.0 / (1.0 + similarity)
+                } else {
+                    sim // Fallback to original similarity
+                }
+            } else {
+                sim
+            };
+            
+            SearchResult {
+                id,
+                distance,
+                metadata: vector_data.metadata.clone(),
+            }
         }).collect();
 
         // Sort candidates by descending similarity
@@ -355,6 +455,24 @@ impl VectorStorage for NanoVectorStorage {
                 
                 // Normalize the vector
                 Self::normalize_vector(&mut vector_data.vector);
+
+                // Apply vector optimization if enabled
+                if let Some(optimizer) = &mut self.optimizer {
+                    let optimized = optimizer.optimize(&vector_data.vector)?;
+                    
+                    // Add optimization metadata
+                    let mut metadata = vector_data.metadata.clone();
+                    if let Some(ratio) = optimized.compression_ratio {
+                        metadata.insert("compression_ratio".to_string(), Value::from(ratio));
+                    }
+                    if let Some(error) = optimized.pq_error.or(optimized.sq_error) {
+                        metadata.insert("quantization_error".to_string(), Value::from(error));
+                    }
+                    vector_data.metadata = metadata;
+                    
+                    // Store optimized vector data
+                    vector_data.optimized = Some(optimized);
+                }
 
                 let mut exists = false;
                 for existing in &mut self.storage {

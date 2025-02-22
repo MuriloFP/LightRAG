@@ -12,7 +12,6 @@ use crate::{
     storage::{
         GraphStorage,
         VectorStorage,
-        vector::SearchResult,
     },
     processing::keywords::{KeywordExtractor, ConversationTurn},
 };
@@ -440,7 +439,7 @@ impl QueryProcessor for MixQueryProcessor {
             .map(|(chunk, score)| (chunk.clone(), *score))
             .unzip();
 
-        let mut final_chunks_clone = final_chunks.clone();
+        let final_chunks_clone = final_chunks.clone();
         Ok(QueryResult {
             context_chunks: final_chunks,
             relevance_scores: final_scores,

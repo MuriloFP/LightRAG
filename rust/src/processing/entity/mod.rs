@@ -1,12 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use async_trait::async_trait;
 
 use crate::types::Error;
-use crate::types::llm::{LLMClient, LLMParams};
-use crate::storage::{GraphStorage, VectorStorage};
 use crate::processing::keywords::ConversationTurn;
 
 /// Errors that can occur during entity extraction

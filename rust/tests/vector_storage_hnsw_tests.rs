@@ -26,6 +26,7 @@ async fn test_hnsw_basic_operations() -> Result<()> {
             meta
         },
         created_at: SystemTime::now(),
+        optimized: None,
     };
 
     let vec2 = VectorData {
@@ -37,6 +38,7 @@ async fn test_hnsw_basic_operations() -> Result<()> {
             meta
         },
         created_at: SystemTime::now(),
+        optimized: None,
     };
 
     // Test batch upsert
@@ -78,6 +80,7 @@ async fn test_hnsw_updates_and_deletions() -> Result<()> {
         vector: vec![1.0, 0.0, 0.0],
         metadata: HashMap::new(),
         created_at: SystemTime::now(),
+        optimized: None,
     };
 
     let vec2 = VectorData {
@@ -85,6 +88,7 @@ async fn test_hnsw_updates_and_deletions() -> Result<()> {
         vector: vec![0.0, 1.0, 0.0],
         metadata: HashMap::new(),
         created_at: SystemTime::now(),
+        optimized: None,
     };
 
     storage.upsert(vec![vec1, vec2]).await?;
@@ -95,6 +99,7 @@ async fn test_hnsw_updates_and_deletions() -> Result<()> {
         vector: vec![0.8, 0.2, 0.0], // More similar to vec1 now
         metadata: HashMap::new(),
         created_at: SystemTime::now(),
+        optimized: None,
     };
 
     let response = storage.upsert(vec![vec2_updated]).await?;
@@ -138,6 +143,7 @@ async fn test_hnsw_batch_operations() -> Result<()> {
                 meta
             },
             created_at: SystemTime::now(),
+            optimized: None,
         });
     }
 
@@ -185,6 +191,7 @@ async fn test_hnsw_persistence_and_reload() -> Result<()> {
                 meta
             },
             created_at: SystemTime::now(),
+            optimized: None,
         }
     }).collect();
 

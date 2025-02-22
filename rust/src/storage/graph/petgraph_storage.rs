@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use crate::types::{Result, Config, Error};
+use crate::types::{Result, Config, Error, KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
@@ -348,9 +348,9 @@ impl PetgraphStorage {
         tokio::task::spawn_blocking(move || {
             if let (Some(&src_idx), Some(&tgt_idx)) = (node_map.get(&source_id), node_map.get(&target_id)) {
                 graph.find_edge(src_idx, tgt_idx).is_some()
-        } else {
-            false
-        }
+            } else {
+                false
+            }
         }).await.unwrap_or(false)
     }
 
@@ -1263,6 +1263,111 @@ impl GraphStorage for PetgraphStorage {
         }
         
         Ok(context)
+    }
+
+    async fn get_all_labels(&self) -> Result<Vec<String>> {
+        let node_map = self.node_map.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut labels: Vec<String> = node_map.keys().cloned().collect();
+            labels.sort();
+            Ok(labels)
+        }).await?
+    }
+
+    async fn get_knowledge_graph(&self, node_label: &str, max_depth: i32) -> Result<KnowledgeGraph> {
+        let node_label = node_label.to_string();
+        let graph = self.graph.clone();
+        let node_map = self.node_map.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut result = KnowledgeGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            };
+            let mut seen_nodes = HashSet::new();
+            let mut seen_edges = HashSet::new();
+
+            // Helper function to add a node and its edges to the result
+            fn add_node_and_edges(
+                graph: &Graph<NodeData, EdgeData>,
+                node_map: &HashMap<String, NodeIndex>,
+                node_id: &str,
+                depth: i32,
+                max_depth: i32,
+                result: &mut KnowledgeGraph,
+                seen_nodes: &mut HashSet<String>,
+                seen_edges: &mut HashSet<String>,
+            ) {
+                if depth > max_depth {
+                    return;
+                }
+
+                // Add the node if not seen before
+                if !seen_nodes.contains(node_id) {
+                    if let Some(&node_idx) = node_map.get(node_id) {
+                        if let Some(node_data) = graph.node_weight(node_idx) {
+                            result.nodes.push(KnowledgeGraphNode {
+                                id: node_id.to_string(),
+                                labels: vec![node_id.to_string()],
+                                properties: node_data.attributes.clone(),
+                            });
+                            seen_nodes.insert(node_id.to_string());
+
+                            // Process edges
+                            for edge in graph.edges(node_idx) {
+                                let source = &graph[edge.source()].id;
+                                let target = &graph[edge.target()].id;
+                                let edge_id = format!("{}-{}", source, target);
+
+                                if !seen_edges.contains(&edge_id) {
+                                    result.edges.push(KnowledgeGraphEdge {
+                                        id: edge_id.clone(),
+                                        edge_type: None,
+                                        source: source.clone(),
+                                        target: target.clone(),
+                                        properties: {
+                                            let mut props = HashMap::new();
+                                            let weight_value = match serde_json::Number::from_f64(edge.weight().weight) {
+                                                Some(num) => num,
+                                                None => serde_json::Number::from(0)
+                                            };
+                                            props.insert("weight".to_string(), serde_json::Value::Number(weight_value));
+                                            if let Some(desc) = &edge.weight().description {
+                                                props.insert("description".to_string(), serde_json::Value::String(desc.clone()));
+                                            }
+                                            if let Some(keywords) = &edge.weight().keywords {
+                                                props.insert("keywords".to_string(), serde_json::Value::Array(
+                                                    keywords.iter().map(|k| serde_json::Value::String(k.clone())).collect()
+                                                ));
+                                            }
+                                            props
+                                        },
+                                    });
+                                    seen_edges.insert(edge_id);
+
+                                    // Recursively process connected nodes
+                                    let next_node = if source == node_id { target } else { source };
+                                    add_node_and_edges(graph, node_map, next_node, depth + 1, max_depth, result, seen_nodes, seen_edges);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if node_label == "*" {
+                // Add all nodes and their edges
+                for node_id in node_map.keys() {
+                    add_node_and_edges(&graph, &node_map, node_id, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
+                }
+            } else {
+                // Start from the specified node
+                add_node_and_edges(&graph, &node_map, &node_label, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
+            }
+
+            info!("Subgraph query successful | Node count: {} | Edge count: {}", result.nodes.len(), result.edges.len());
+            Ok(result)
+        }).await?
     }
 }
 

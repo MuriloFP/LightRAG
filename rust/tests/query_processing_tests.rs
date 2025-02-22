@@ -240,6 +240,95 @@ impl GraphStorage for MockGraphStorage {
         
         Ok(context)
     }
+
+    async fn get_all_labels(&self) -> Result<Vec<String>, Error> {
+        // Return all node IDs as labels for the mock implementation
+        Ok(self.nodes.keys().cloned().collect())
+    }
+
+    async fn get_knowledge_graph(&self, node_label: &str, max_depth: i32) -> Result<super_lightrag::types::KnowledgeGraph, Error> {
+        use super_lightrag::types::{KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge};
+        use std::collections::HashSet;
+
+        let mut result = KnowledgeGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+
+        let mut seen_nodes = HashSet::new();
+        let mut seen_edges = HashSet::new();
+
+        // Helper function to add a node and its edges recursively
+        fn add_node_and_edges(
+            storage: &MockGraphStorage,
+            node_id: &str,
+            depth: i32,
+            max_depth: i32,
+            result: &mut KnowledgeGraph,
+            seen_nodes: &mut HashSet<String>,
+            seen_edges: &mut HashSet<String>,
+        ) {
+            if depth > max_depth || seen_nodes.contains(node_id) {
+                return;
+            }
+
+            // Add the node
+            if let Some(node_data) = storage.nodes.get(node_id) {
+                result.nodes.push(KnowledgeGraphNode {
+                    id: node_id.to_string(),
+                    labels: vec![node_id.to_string()],
+                    properties: node_data.attributes.clone(),
+                });
+                seen_nodes.insert(node_id.to_string());
+
+                // Add edges
+                for (edge_id, (src, tgt, edge_data)) in &storage.edges {
+                    if src == node_id || tgt == node_id {
+                        if !seen_edges.contains(edge_id) {
+                            result.edges.push(KnowledgeGraphEdge {
+                                id: edge_id.clone(),
+                                edge_type: None,
+                                source: src.clone(),
+                                target: tgt.clone(),
+                                properties: {
+                                    let mut props = HashMap::new();
+                                    let weight_value = serde_json::Number::from_f64(edge_data.weight)
+                                        .unwrap_or_else(|| serde_json::Number::from(0));
+                                    props.insert("weight".to_string(), serde_json::Value::Number(weight_value));
+                                    if let Some(desc) = &edge_data.description {
+                                        props.insert("description".to_string(), serde_json::Value::String(desc.clone()));
+                                    }
+                                    if let Some(keywords) = &edge_data.keywords {
+                                        props.insert("keywords".to_string(), serde_json::Value::Array(
+                                            keywords.iter().map(|k| serde_json::Value::String(k.clone())).collect()
+                                        ));
+                                    }
+                                    props
+                                },
+                            });
+                            seen_edges.insert(edge_id.clone());
+
+                            // Recursively process connected node
+                            let next_node = if src == node_id { tgt } else { src };
+                            add_node_and_edges(storage, next_node, depth + 1, max_depth, result, seen_nodes, seen_edges);
+                        }
+                    }
+                }
+            }
+        }
+
+        if node_label == "*" {
+            // Add all nodes and their edges
+            for node_id in self.nodes.keys() {
+                add_node_and_edges(self, node_id, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
+            }
+        } else {
+            // Start from the specified node
+            add_node_and_edges(self, node_label, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
+        }
+
+        Ok(result)
+    }
 }
 
 struct MockKeywordExtractor {

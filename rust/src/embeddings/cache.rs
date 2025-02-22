@@ -76,7 +76,7 @@ impl EmbeddingCache {
     pub fn get_stats(&self) -> &CacheStats {
         &self.stats
     }
-
+    
     /// Get a cached response
     pub fn get(&self, text: &str) -> Option<EmbeddingResponse> {
         if !self.config.enabled {
@@ -89,9 +89,9 @@ impl EmbeddingCache {
             if let Some(ttl) = self.config.ttl_seconds {
                 if entry.timestamp.elapsed().unwrap().as_secs() > ttl {
                     return None;
-                }
-            }
-            let mut response = entry.response.clone();
+                        }
+                    }
+                    let mut response = entry.response.clone();
             if response.metadata.get("quantization_error").is_none() {
                 if let Some(q_err) = entry.quantization_error {
                     response.metadata.insert("quantization_error".to_string(), q_err.to_string());
@@ -102,7 +102,7 @@ impl EmbeddingCache {
         
         None
     }
-
+    
     /// Calculate optimal number of quantization bits based on embedding distribution
     fn calculate_optimal_bits(&self, embedding: &[f32]) -> u8 {
         if !self.config.use_quantization {
@@ -137,10 +137,15 @@ impl EmbeddingCache {
             max_val = max_val.max(val);
         }
 
-        // Calculate scale factor based on number of bits
+        // Add small epsilon to avoid edge cases
+        let epsilon = 1e-6;
+        max_val += epsilon;
+        min_val -= epsilon;
+
+        // Calculate quantization parameters
         let bits = self.config.quantization_bits;
-        let levels = (1u32 << bits) - 1;
-        let scale = (max_val - min_val) / levels as f32;
+        let levels = (1u32 << bits) as f32;  // 2^n levels for n bits
+        let scale = (max_val - min_val) / (levels - 1.0);
 
         // Avoid division by zero
         if scale == 0.0 {
@@ -149,24 +154,29 @@ impl EmbeddingCache {
 
         // Quantize values
         let mut quantized = Vec::with_capacity(embedding.len());
-        let mut total_error = 0.0;
+        let mut total_squared_error = 0.0;
+        let mut max_abs_error: f32 = 0.0;
 
         for &val in embedding {
-            // Scale and round to nearest integer
-            let scaled = ((val - min_val) / scale).round() as u32;
-            // Clamp to valid range
-            let clamped = scaled.min(levels);
+            // Scale to [0, levels-1] range and round
+            let scaled = ((val - min_val) / scale).round();
+            
+            // Clamp to valid range and convert to quantized value
+            let clamped = scaled.clamp(0.0, levels - 1.0);
             let quantized_val = clamped as u8;
             quantized.push(quantized_val);
 
             // Calculate error in original space
             let reconstructed = (quantized_val as f32 * scale) + min_val;
             let error = (val - reconstructed).abs();
-            total_error += error;
+            total_squared_error += error * error;
+            max_abs_error = max_abs_error.max(error);
         }
 
-        let avg_error = total_error / embedding.len() as f32;
-        Ok((quantized, min_val, max_val, avg_error))
+        // Use root mean square error (RMSE) as the error metric
+        let rmse = (total_squared_error / embedding.len() as f32).sqrt();
+        
+        Ok((quantized, min_val, max_val, rmse))
     }
 
     /// Dequantize an n-bit integer embedding back to floating-point
@@ -180,8 +190,8 @@ impl EmbeddingCache {
         }
 
         let bits = self.config.quantization_bits;
-        let levels = (1u32 << bits) - 1;
-        let scale = (max_val - min_val) / levels as f32;
+        let levels = (1u32 << bits) as f32;  // 2^n levels for n bits
+        let scale = (max_val - min_val) / (levels - 1.0);
 
         let mut dequantized = Vec::with_capacity(original_len);
         for &q in quantized {
@@ -269,7 +279,7 @@ impl EmbeddingCache {
             } else {
                 (None, None)
             }
-        } else {
+            } else {
             (None, None)
         };
         
@@ -335,7 +345,7 @@ impl EmbeddingCache {
     pub fn get_config(&self) -> &CacheConfig {
         &self.config
     }
-
+    
     /// Update the cache configuration
     pub fn update_config(&mut self, config: CacheConfig) {
         self.config = config;
@@ -354,4 +364,4 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot_product / (norm_a * norm_b)
     }
-}
+} 

@@ -142,7 +142,6 @@ pub mod query;
 
 pub use context::*;
 pub use entity::*;
-pub use keywords::*;
 pub use query::*;
 
 // Future processing functions and types will be added here. 

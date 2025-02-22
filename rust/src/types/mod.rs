@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
+use std::collections::HashMap;
 
 // Submodules
 /// Language model (LLM) types and interfaces.
@@ -26,6 +27,41 @@ pub mod embeddings;
 // Re-exports
 pub use llm::{LLMClient, LLMConfig, LLMParams, LLMResponse, LLMError};
 pub use embeddings::{EmbeddingProvider, EmbeddingConfig, EmbeddingError, EmbeddingResponse};
+
+/// A node in the knowledge graph with its properties and labels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeGraphNode {
+    /// Unique identifier for the node.
+    pub id: String,
+    /// List of labels/types associated with the node.
+    pub labels: Vec<String>,
+    /// Map of property key-value pairs associated with the node.
+    pub properties: HashMap<String, serde_json::Value>,
+}
+
+/// An edge in the knowledge graph with its properties.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeGraphEdge {
+    /// Unique identifier for the edge.
+    pub id: String,
+    /// Type/label of the edge relationship.
+    pub edge_type: Option<String>,
+    /// ID of the source node.
+    pub source: String,
+    /// ID of the target node.
+    pub target: String,
+    /// Map of property key-value pairs associated with the edge.
+    pub properties: HashMap<String, serde_json::Value>,
+}
+
+/// A knowledge graph containing nodes and their relationships.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeGraph {
+    /// List of nodes in the graph.
+    pub nodes: Vec<KnowledgeGraphNode>,
+    /// List of edges connecting the nodes.
+    pub edges: Vec<KnowledgeGraphEdge>,
+}
 
 /// Custom error type for SuperLightRAG operations
 #[derive(Error, Debug)]
@@ -111,6 +147,16 @@ impl Config {
         self.extra_config.get(key)
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
+    }
+
+    /// Gets a boolean value from the config
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.extra_config.get(key).and_then(|v| v.as_bool())
+    }
+
+    /// Gets a u8 value from the config
+    pub fn get_u8(&self, key: &str) -> Option<u8> {
+        self.extra_config.get(key).and_then(|v| v.as_u64()).map(|v| v as u8)
     }
 
     /// Ensures the working directory exists

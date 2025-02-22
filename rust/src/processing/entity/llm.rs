@@ -274,6 +274,7 @@ Text: {}"#,
             vector: vec![0.0; 384], // Default vector, will be computed by the vector store
             metadata: vec_metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
         
         self.entity_vector_store.write().await
@@ -310,9 +311,10 @@ Text: {}"#,
         
         let vector_data = VectorData {
             id: format!("rel-{}-{}", rel.src_id, rel.tgt_id),
-            vector: vec![0.0; 384],
+            vector: vec![0.0; 384], // Default vector, will be computed by the vector store
             metadata: vec_metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
         
         self.relationship_vector_store.write().await

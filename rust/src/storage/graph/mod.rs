@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use crate::storage::graph::embeddings::EmbeddingAlgorithm;
 use serde_json::Value;
+use crate::types::KnowledgeGraph;
 
 /// Trait for graph storage operations
 #[async_trait]
@@ -79,6 +80,12 @@ pub trait GraphStorage: Send + Sync {
 
     /// Generates embeddings for all nodes
     async fn embed_nodes(&self, algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>)>;
+
+    /// Gets all labels in the graph
+    async fn get_all_labels(&self) -> Result<Vec<String>>;
+
+    /// Gets a knowledge graph starting from a node
+    async fn get_knowledge_graph(&self, node_label: &str, max_depth: i32) -> Result<KnowledgeGraph>;
 }
 
 /// Module for graph storage implementation using petgraph.

@@ -26,6 +26,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0],
             metadata: HashMap::new(),
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         let mut meta2 = HashMap::new();
@@ -35,6 +36,7 @@ mod tests {
             vector: vec![0.0, 1.0, 0.0],
             metadata: meta2.clone(),
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         // Upsert both vectors
@@ -56,6 +58,7 @@ mod tests {
             vector: vec![0.9, 0.1, 0.0],
             metadata: meta2.clone(),
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         let response = storage.upsert(vec![vec2_updated]).await?;
@@ -97,6 +100,7 @@ mod tests {
                 vector: vec![i as f32, (i + 1) as f32, (i + 2) as f32],
                 metadata,
                 created_at: SystemTime::now(),
+                optimized: None,
             });
         }
 
@@ -143,6 +147,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0],
             metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         // Insert vector
@@ -188,6 +193,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0],
             metadata: HashMap::new(),
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         let vec2 = VectorData {
@@ -195,6 +201,7 @@ mod tests {
             vector: vec![0.0, 1.0, 0.0],
             metadata: HashMap::new(),
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         storage.upsert(vec![vec1, vec2]).await?;
@@ -218,12 +225,14 @@ mod tests {
                 vector: vec![1.0, 0.0, 0.0],
                 metadata: HashMap::new(),
                 created_at: SystemTime::now(),
+                optimized: None,
             },
             VectorData {
                 id: "vec2".to_string(),
                 vector: vec![0.0, 1.0, 0.0],
                 metadata: HashMap::new(),
                 created_at: SystemTime::now(),
+                optimized: None,
             },
         ]).await?;
 
@@ -254,6 +263,7 @@ mod tests {
             vector: vec![1.0, 0.0, 0.0],
             metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         // Create relation vectors
@@ -264,6 +274,7 @@ mod tests {
             vector: vec![0.0, 1.0, 0.0],
             metadata: rel1_metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         let mut rel2_metadata = HashMap::new();
@@ -273,6 +284,7 @@ mod tests {
             vector: vec![0.0, 0.0, 1.0],
             metadata: rel2_metadata,
             created_at: SystemTime::now(),
+            optimized: None,
         };
 
         // Insert vectors

@@ -4,10 +4,10 @@ use futures::StreamExt;
 use tokio;
 
 use super_lightrag::llm::{
-    LLMClient, LLMConfig, LLMParams, LLMResponse,
+    LLMClient, LLMConfig, LLMParams,
     providers::{OpenAIClient, OllamaClient},
 };
-use super_lightrag::types::llm::{StreamingResponse, StreamingTiming};
+use super_lightrag::types::llm::StreamingTiming;
 
 #[tokio::test]
 async fn test_openai_streaming() {
