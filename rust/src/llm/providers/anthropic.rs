@@ -9,35 +9,40 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use futures::future::BoxFuture;
 
 use crate::llm::{
     LLMClient, LLMConfig, LLMError, LLMParams, LLMResponse,
     cache::{ResponseCache, InMemoryCache},
 };
 use crate::types::llm::{QueryParams, StreamingResponse, StreamingTiming};
+use crate::processing::keywords::ConversationTurn;
+use crate::llm::streaming::{StreamProcessor, StreamConfig};
 
 /// Anthropic API response format
 #[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    completion: String,
-    stop_reason: Option<String>,
-    model: String,
+pub struct AnthropicResponse {
+    pub completion: String,
+    pub stop_reason: Option<String>,
+    pub model: String,
     #[serde(default)]
-    usage: AnthropicUsage,
+    pub usage: AnthropicUsage,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct AnthropicUsage {
-    input_tokens: Option<usize>,
-    output_tokens: Option<usize>,
+pub struct AnthropicUsage {
+    pub input_tokens: Option<usize>,
+    pub output_tokens: Option<usize>,
 }
 
 /// Anthropic streaming response format
 #[derive(Debug, Deserialize)]
-struct AnthropicStreamResponse {
-    completion: String,
-    stop_reason: Option<String>,
-    model: Option<String>,
+pub struct AnthropicStreamResponse {
+    pub completion: String,
+    pub stop_reason: Option<String>,
+    pub model: Option<String>,
+    pub usage: Option<AnthropicUsage>,
 }
 
 /// Anthropic client implementation
@@ -106,10 +111,39 @@ impl AnthropicClient {
         Ok(headers)
     }
 
-    /// Build request payload
+    /// Build conversation context from history
+    fn build_conversation(&self, prompt: &str, history: Option<&[ConversationTurn]>, params: &LLMParams) -> String {
+        let mut conversation = String::new();
+        
+        // Add system prompt if provided
+        if let Some(system) = &params.system_prompt {
+            conversation.push_str(&format!("\n\nSystem: {}", system));
+        }
+        
+        // Add conversation history
+        if let Some(history) = history {
+            for turn in history {
+                match turn.role.as_str() {
+                    "user" => conversation.push_str(&format!("\n\nHuman: {}", turn.content)),
+                    "assistant" => conversation.push_str(&format!("\n\nAssistant: {}", turn.content)),
+                    "system" => conversation.push_str(&format!("\n\nSystem: {}", turn.content)),
+                    _ => conversation.push_str(&format!("\n\n{}: {}", turn.role, turn.content)),
+                }
+            }
+        }
+        
+        // Add current prompt
+        conversation.push_str(&format!("\n\nHuman: {}\n\nAssistant:", prompt));
+        
+        conversation
+    }
+
+    /// Build request payload with conversation history
     fn build_request(&self, prompt: &str, params: &LLMParams) -> serde_json::Value {
+        let conversation = self.build_conversation(prompt, None, params);
+        
         let mut request = json!({
-            "prompt": format!("\n\nHuman: {}\n\nAssistant:", prompt),
+            "prompt": conversation,
             "model": params.model.split('/').nth(1).unwrap_or("claude-2"),
             "max_tokens_to_sample": params.max_tokens,
             "temperature": params.temperature,
@@ -117,9 +151,26 @@ impl AnthropicClient {
             "stream": params.stream,
         });
 
-        if let Some(system) = &params.system_prompt {
-            request["system"] = json!(system);
+        // Add any extra parameters
+        for (key, value) in &params.extra_params {
+            request[key] = json!(value);
         }
+
+        request
+    }
+
+    /// Build request payload with explicit history
+    fn build_request_with_history(&self, prompt: &str, history: &[ConversationTurn], params: &LLMParams) -> serde_json::Value {
+        let conversation = self.build_conversation(prompt, Some(history), params);
+        
+        let mut request = json!({
+            "prompt": conversation,
+            "model": params.model.split('/').nth(1).unwrap_or("claude-2"),
+            "max_tokens_to_sample": params.max_tokens,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "stream": params.stream,
+        });
 
         // Add any extra parameters
         for (key, value) in &params.extra_params {
@@ -161,6 +212,10 @@ impl LLMClient for AnthropicClient {
                 return Ok(cached);
             }
         }
+
+        // Estimate tokens and check rate limits
+        let estimated_tokens = prompt.split_whitespace().count() as u32 + params.max_tokens as u32;
+        self.check_rate_limit(estimated_tokens).await?;
 
         let url = self.build_url()?;
         let headers = self.build_headers()?;
@@ -206,11 +261,91 @@ impl LLMClient for AnthropicClient {
         Ok(response)
     }
 
+    async fn generate_with_history(
+        &self,
+        prompt: &str,
+        history: &[ConversationTurn],
+        params: &LLMParams
+    ) -> Result<LLMResponse, LLMError> {
+        // Check cache first if enabled
+        if let Some(cache) = &self.cache {
+            // Create a cache key that includes history
+            let cache_key = format!("{:?}:{}", history, prompt);
+            if let Some(cached) = cache.get(&cache_key).await {
+                return Ok(cached);
+            }
+        }
+
+        // Estimate tokens and check rate limits
+        let estimated_tokens = prompt.split_whitespace().count() as u32 + 
+            history.iter().map(|turn| turn.content.split_whitespace().count() as u32).sum::<u32>() +
+            params.max_tokens as u32;
+        
+        self.check_rate_limit(estimated_tokens).await?;
+
+        let url = self.build_url()?;
+        let headers = self.build_headers()?;
+        let request = self.build_request_with_history(prompt, history, params);
+
+        let response = self.client.post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await
+            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(LLMError::RequestFailed(format!(
+                "Anthropic API error ({}): {}", status, response_text
+            )));
+        }
+
+        let anthropic_response: AnthropicResponse = serde_json::from_str(&response_text)
+            .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
+
+        let total_tokens = anthropic_response.usage.input_tokens.unwrap_or(0) +
+                          anthropic_response.usage.output_tokens.unwrap_or(0);
+
+        let response = LLMResponse {
+            text: anthropic_response.completion,
+            tokens_used: total_tokens,
+            model: anthropic_response.model,
+            cached: false,
+            context: None,
+            metadata: {
+                let mut map = HashMap::new();
+                if let Some(input_tokens) = anthropic_response.usage.input_tokens {
+                    map.insert("input_tokens".to_string(), input_tokens.to_string());
+                }
+                if let Some(output_tokens) = anthropic_response.usage.output_tokens {
+                    map.insert("output_tokens".to_string(), output_tokens.to_string());
+                }
+                map
+            },
+        };
+
+        // Update cache if enabled
+        if let Some(cache) = &self.cache {
+            let cache_key = format!("{:?}:{}", history, prompt);
+            let _ = cache.put(&cache_key, response.clone()).await;
+        }
+
+        Ok(response)
+    }
+
     async fn generate_stream(
         &self,
         prompt: &str,
         params: &LLMParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        // Estimate tokens and check rate limits
+        let estimated_tokens = prompt.split_whitespace().count() as u32 + params.max_tokens as u32;
+        self.check_rate_limit(estimated_tokens).await?;
+
         let url = self.build_url()?;
         let headers = self.build_headers()?;
         let mut request = self.build_request(prompt, params);
@@ -229,77 +364,33 @@ impl LLMClient for AnthropicClient {
             return Err(LLMError::RequestFailed(error));
         }
 
-        let (tx, rx) = mpsc::channel(32);
-        let mut stream = response.bytes_stream();
-        let start_time = Instant::now();
-
-        tokio::spawn(async move {
-            let mut buffer = String::new();
-            let mut total_tokens = 0;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&chunk_str);
-
-                        // Process complete messages
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].trim().to_string();
-                            buffer = buffer[pos + 1..].to_string();
-
-                            if line.is_empty() || line == "data: [DONE]" {
-                                continue;
-                            }
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                match serde_json::from_str::<AnthropicStreamResponse>(data) {
-                                    Ok(response) => {
-                                        let is_done = response.stop_reason.is_some();
-                                        let chunk_tokens = response.completion.split_whitespace().count();
-                                        total_tokens += chunk_tokens;
-
-                                        let timing = StreamingTiming {
-                                            chunk_duration: start_time.elapsed().as_micros() as u64,
-                                            total_duration: start_time.elapsed().as_micros() as u64,
-                                            prompt_eval_duration: Some(Duration::from_secs(0).as_micros() as u64),
-                                            token_gen_duration: Some(Duration::from_secs(0).as_micros() as u64),
-                                        };
-
-                                        let stream_response = StreamingResponse {
-                                            text: response.completion,
-                                            chunk_tokens,
-                                            total_tokens,
-                                            done: is_done,
-                                            timing: Some(timing),
-                                            metadata: HashMap::new(),
-                                        };
-
-                                        if tx.send(Ok(stream_response)).await.is_err() {
-                                            break;
-                                        }
-
-                                        if is_done {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Err(LLMError::InvalidResponse(e.to_string()))).await;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(LLMError::RequestFailed(e.to_string()))).await;
-                        break;
-                    }
-                }
-            }
+        let stream = response.bytes_stream();
+        let mut processor = StreamProcessor::new(StreamConfig {
+            enable_batching: true,
+            max_batch_size: 8192,
+            max_batch_wait_ms: 50,
+            ..Default::default()
         });
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        // Create async parser for Anthropic stream format
+        let parser = |text: &str| -> futures::future::BoxFuture<'static, Result<Option<(String, bool, std::collections::HashMap<String, String>)>, LLMError>> {
+            let owned_text = text.to_owned();
+            Box::pin(async move {
+                match serde_json::from_str::<AnthropicStreamResponse>(&owned_text) {
+                    Ok(response) => {
+                        let is_done = response.stop_reason.is_some();
+                        let mut metadata = std::collections::HashMap::new();
+                        if let Some(model) = response.model {
+                            metadata.insert("model".to_string(), model.to_owned());
+                        }
+                        Ok(Some((response.completion.to_owned(), is_done, metadata)))
+                    }
+                    Err(e) => Err(LLMError::InvalidResponse(e.to_string()))
+                }
+            })
+        };
+
+        Ok(processor.process_stream(stream, parser).await)
     }
 
     async fn batch_generate(

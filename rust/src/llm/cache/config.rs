@@ -143,8 +143,8 @@ impl Default for CacheConfig {
             enabled: true,
             ttl: Some(Duration::from_secs(3600)), // 1 hour
             max_entries: Some(1000),
-            similarity_enabled: false,
-            similarity_threshold: 0.8,
+            similarity_enabled: true, // Enable by default
+            similarity_threshold: 0.85, // Higher threshold for better matches
             stream_cache_enabled: true,
             max_stream_chunks: Some(1000),
             compress_streams: false,

@@ -19,6 +19,10 @@ use crate::llm::{
 use crate::types::llm::{QueryParams, StreamingResponse, StreamingTiming};
 use crate::processing::keywords::ConversationTurn;
 use crate::processing::context::ContextBuilder;
+use crate::llm::streaming::{StreamProcessor, StreamConfig};
+use crate::llm::providers::openai::{OpenAIChatStreamResponse, OpenAIChatStreamDelta};
+use crate::llm::providers::anthropic::AnthropicStreamResponse;
+use crate::llm::providers::ollama::OllamaStreamResponse;
 
 /// Supported LLM providers
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -371,14 +375,24 @@ impl LLMClient for LiteLLMClient {
 
         // Try primary provider
         match adapter.complete_stream(prompt, params).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => {
+                // Map the stream to the expected type
+                let mapped_stream = stream.map(|result| match result {
+                    Ok(response) => Ok(response),
+                    Err(e) => Err(e),
+                });
+                Ok(Box::pin(mapped_stream))
+            },
             Err(e) => {
                 // Try fallback providers if configured
                 for fallback in &self.config.fallback_providers {
                     if let Some(fallback_adapter) = self.get_provider_adapter(fallback) {
-                        match fallback_adapter.complete_stream(prompt, params).await {
-                            Ok(stream) => return Ok(stream),
-                            Err(_) => continue,
+                        if let Ok(stream) = fallback_adapter.complete_stream(prompt, params).await {
+                            let mapped_stream = stream.map(|result| match result {
+                                Ok(response) => Ok(response),
+                                Err(e) => Err(e),
+                            });
+                            return Ok(Box::pin(mapped_stream));
                         }
                     }
                 }
