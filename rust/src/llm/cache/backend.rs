@@ -202,31 +202,8 @@ pub trait CacheBackend: Send + Sync + Any {
     async fn health_check(&self) -> Result<(), CacheError>;
 
     /// Get entries with priority above the threshold
-    async fn get_high_priority_entries(&self, min_priority: u32, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
-        // Default implementation that scans all entries
-        let mut result = Vec::new();
-        let mut cursor = 0;
-        let batch_size = 100;
-
-        loop {
-            let batch = self.get_entries_batch(cursor, batch_size).await?;
-            if batch.is_empty() {
-                break;
-            }
-
-            for entry in batch {
-                if entry.priority as u32 >= min_priority {
-                    result.push(entry);
-                    if result.len() >= limit {
-                        return Ok(result);
-                    }
-                }
-            }
-
-            cursor += batch_size;
-        }
-
-        Ok(result)
+    async fn get_high_priority_entries(&self, min_priority: u32, max_items: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        Err(CacheError::UnsupportedOperation("get_high_priority_entries not implemented".to_string()))
     }
 
     /// Get a batch of entries starting from an offset

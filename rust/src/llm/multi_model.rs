@@ -49,8 +49,30 @@ impl MultiModel {
     }
 
     pub async fn complete(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        let model = self.next_model()?;
-        model.provider.complete(prompt, params).await
+        // Start with the next model
+        let mut current = self.current_model.lock().unwrap();
+        let start_idx = *current;
+        let mut last_error = None;
+        
+        // Try each model in sequence until one succeeds
+        for _ in 0..self.models.len() {
+            *current = (*current + 1) % self.models.len();
+            let model = self.models[*current].clone();
+            
+            println!("Trying model: {}, with config: {:?}", params.model, model.config);
+            
+            match model.provider.complete(prompt, params).await {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    println!("Model failed with error: {:?}", err);
+                    last_error = Some(err);
+                    continue;
+                }
+            }
+        }
+        
+        // If we reach here, all models failed
+        Err(last_error.unwrap_or_else(|| LLMError::RequestFailed("All models failed".to_string())))
     }
 
     pub async fn complete_stream(
@@ -58,8 +80,30 @@ impl MultiModel {
         prompt: &str,
         params: &LLMParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
-        let model = self.next_model()?;
-        model.provider.complete_stream(prompt, params).await
+        // Start with the next model
+        let mut current = self.current_model.lock().unwrap();
+        let start_idx = *current;
+        let mut last_error = None;
+        
+        // Try each model in sequence until one succeeds
+        for _ in 0..self.models.len() {
+            *current = (*current + 1) % self.models.len();
+            let model = self.models[*current].clone();
+            
+            println!("Trying stream model: {}, with config: {:?}", params.model, model.config);
+            
+            match model.provider.complete_stream(prompt, params).await {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    println!("Stream model failed with error: {:?}", err);
+                    last_error = Some(err);
+                    continue;
+                }
+            }
+        }
+        
+        // If we reach here, all models failed
+        Err(last_error.unwrap_or_else(|| LLMError::RequestFailed("All streaming models failed".to_string())))
     }
 
     pub async fn complete_batch(
@@ -67,8 +111,30 @@ impl MultiModel {
         prompts: &[String],
         params: &LLMParams,
     ) -> Result<Vec<LLMResponse>, LLMError> {
-        let model = self.next_model()?;
-        model.provider.complete_batch(prompts, params).await
+        // Start with the next model
+        let mut current = self.current_model.lock().unwrap();
+        let start_idx = *current;
+        let mut last_error = None;
+        
+        // Try each model in sequence until one succeeds
+        for _ in 0..self.models.len() {
+            *current = (*current + 1) % self.models.len();
+            let model = self.models[*current].clone();
+            
+            println!("Trying batch model: {}, with config: {:?}", params.model, model.config);
+            
+            match model.provider.complete_batch(prompts, params).await {
+                Ok(responses) => return Ok(responses),
+                Err(err) => {
+                    println!("Batch model failed with error: {:?}", err);
+                    last_error = Some(err);
+                    continue;
+                }
+            }
+        }
+        
+        // If we reach here, all models failed
+        Err(last_error.unwrap_or_else(|| LLMError::RequestFailed("All batch models failed".to_string())))
     }
 }
 

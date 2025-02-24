@@ -42,10 +42,15 @@ impl MemoryCache {
     
     /// Check storage quota
     async fn check_quota(&self, new_size: usize) -> Result<(), CacheError> {
-        let stats = self.stats.read().await;
-        let total_size_mb = (stats.total_size_bytes + new_size) as f64 / 1024.0 / 1024.0;
+        let storage = self.storage.read().await;
+        let current_size: usize = storage
+            .values()
+            .map(|entry| entry.metadata.size_bytes)
+            .sum();
         
-        if total_size_mb > self.config.max_storage_mb as f64 {
+        let total_size_mb = (current_size + new_size) as f64 / 1024.0 / 1024.0;
+        
+        if total_size_mb > self.config.max_memory_mb as f64 {
             Err(CacheError::QuotaExceeded)
         } else {
             Ok(())
@@ -115,15 +120,19 @@ impl CacheBackend for MemoryCache {
     }
     
     async fn set(&self, entry: CacheEntry) -> Result<(), CacheError> {
-        // Check quota
+        // Check quota before inserting
         self.check_quota(entry.metadata.size_bytes).await?;
         
-        // Store entry
         let mut storage = self.storage.write().await;
         storage.insert(entry.key.clone(), entry);
         
-        // Update stats
-        self.update_stats().await;
+        // Update stats while holding the write lock
+        let mut stats = self.stats.write().await;
+        stats.item_count = storage.len();
+        stats.total_size_bytes = storage
+            .values()
+            .map(|entry| entry.metadata.size_bytes)
+            .sum();
         
         Ok(())
     }

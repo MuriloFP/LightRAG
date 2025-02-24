@@ -25,6 +25,8 @@ pub struct TieredCacheConfig {
     pub max_sync_batch_size: usize,
     /// Cache warming configuration
     pub warming_config: Option<CacheWarmingConfig>,
+    /// Disable background tasks (useful for testing to prevent deadlocks)
+    pub disable_background_tasks: bool,
 }
 
 impl Default for TieredCacheConfig {
@@ -36,6 +38,7 @@ impl Default for TieredCacheConfig {
             write_through: true,
             max_sync_batch_size: 100,
             warming_config: None,
+            disable_background_tasks: false,
         }
     }
 }
@@ -111,23 +114,21 @@ impl TieredCache {
             warming_task: None,
         };
         
-        // Start background sync if interval > 0
-        if config.sync_interval_secs > 0 {
+        // Start background sync if interval > 0 and background tasks are not disabled
+        if !config.disable_background_tasks && config.sync_interval_secs > 0 {
             cache.start_background_sync().await?;
         }
 
-        // Start cache warming if enabled
-        if let Some(warming_config) = &config.warming_config {
-            if warming_config.enabled {
-                cache.start_cache_warming().await?;
-            }
+        // Start cache warming if enabled and background tasks are not disabled
+        if !config.disable_background_tasks && config.warming_config.as_ref().map_or(false, |wc| wc.enabled) {
+            cache.start_cache_warming().await?;
         }
         
         Ok(cache)
     }
     
     /// Start background synchronization task
-    async fn start_background_sync(&self) -> Result<(), CacheError> {
+    async fn start_background_sync(&mut self) -> Result<(), CacheError> {
         let l1_cache = Arc::clone(&self.l1_cache);
         let l2_cache = Arc::clone(&self.l2_cache);
         let config = self.config.clone();
@@ -153,6 +154,7 @@ impl TieredCache {
             }
         });
         
+        self.sync_task = Some(handle);
         Ok(())
     }
     
@@ -316,6 +318,20 @@ impl TieredCache {
     }
 }
 
+impl Drop for TieredCache {
+    fn drop(&mut self) {
+        // Abort any background tasks to prevent deadlocks
+        if let Some(handle) = self.sync_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.warming_task.take() {
+            handle.abort();
+        }
+        
+        println!("TieredCache::drop - Background tasks aborted");
+    }
+}
+
 #[async_trait]
 impl CacheBackend for TieredCache {
     fn backend_type(&self) -> CacheType {
@@ -344,18 +360,57 @@ impl CacheBackend for TieredCache {
     }
     
     async fn get(&self, key: &str) -> Result<CacheEntry, CacheError> {
+        println!("TieredCache::get - Starting for key: {}", key);
+        
         // Try L1 first
-        match self.l1_cache.read().await.get(key).await {
-            Ok(entry) => Ok(entry),
+        println!("TieredCache::get - Acquiring L1 read lock");
+        let l1_read_guard = self.l1_cache.read().await;
+        println!("TieredCache::get - Acquired L1 read lock");
+        
+        match l1_read_guard.get(key).await {
+            Ok(entry) => {
+                println!("TieredCache::get - Found in L1, releasing L1 read lock");
+                // Explicitly drop the guard to make it clear when we release the lock
+                drop(l1_read_guard);
+                Ok(entry)
+            },
             Err(_) => {
+                println!("TieredCache::get - Not found in L1, releasing L1 read lock");
+                // Explicitly drop the guard to make it clear when we release the lock
+                drop(l1_read_guard);
+                
                 // On L1 miss, try L2
-                match self.l2_cache.read().await.get(key).await {
+                println!("TieredCache::get - Acquiring L2 read lock");
+                let l2_read_guard = self.l2_cache.read().await;
+                println!("TieredCache::get - Acquired L2 read lock");
+                
+                let l2_result = l2_read_guard.get(key).await;
+                println!("TieredCache::get - L2 lookup completed, releasing L2 read lock");
+                // Explicitly drop the guard to make it clear when we release the lock
+                drop(l2_read_guard);
+                
+                // Only if we successfully got an entry from L2, store it in L1
+                match l2_result {
                     Ok(entry) => {
-                        // Cache in L1
-                        self.l1_cache.write().await.set(entry.clone()).await?;
+                        println!("TieredCache::get - Found in L2, preparing to store in L1");
+                        // Cache in L1 - we already released the L2 read lock
+                        println!("TieredCache::get - Acquiring L1 write lock");
+                        let mut l1_write_guard = self.l1_cache.write().await;
+                        println!("TieredCache::get - Acquired L1 write lock");
+                        
+                        let set_result = l1_write_guard.set(entry.clone()).await;
+                        println!("TieredCache::get - Set operation completed, releasing L1 write lock");
+                        // Explicitly drop the guard to make it clear when we release the lock
+                        drop(l1_write_guard);
+                        
+                        set_result?;
+                        println!("TieredCache::get - Stored in L1 successfully");
                         Ok(entry)
                     }
-                    Err(e) => Err(e)
+                    Err(e) => {
+                        println!("TieredCache::get - Not found in L2: {:?}", e);
+                        Err(e)
+                    }
                 }
             }
         }
@@ -525,78 +580,136 @@ impl CacheBackend for TieredCache {
 
 impl CompressibleCache for TieredCache {
     fn compression_level(&self) -> u32 {
+        println!("TieredCache::compression_level - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        if let Some(backend) = guard.as_compressible() {
+        println!("TieredCache::compression_level - Acquired blocking read lock on L2");
+        let result = if let Some(backend) = guard.as_compressible() {
             backend.compression_level()
         } else {
             4 // Default compression level
-        }
+        };
+        println!("TieredCache::compression_level - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     fn set_compression_level(&mut self, level: u32) {
+        println!("TieredCache::set_compression_level - Using blocking_write on L2 cache");
         let mut guard = self.l2_cache.blocking_write();
+        println!("TieredCache::set_compression_level - Acquired blocking write lock on L2");
         if let Some(backend) = guard.as_mut_compressible() {
             backend.set_compression_level(level);
         }
+        println!("TieredCache::set_compression_level - Releasing blocking write lock on L2");
+        drop(guard);
     }
 
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        println!("TieredCache::compress - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        if let Some(backend) = guard.as_compressible() {
+        println!("TieredCache::compress - Acquired blocking read lock on L2");
+        let result = if let Some(backend) = guard.as_compressible() {
             backend.compress(data)
         } else {
             Ok(data.to_vec())
-        }
+        };
+        println!("TieredCache::compress - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        println!("TieredCache::decompress - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        if let Some(backend) = guard.as_compressible() {
+        println!("TieredCache::decompress - Acquired blocking read lock on L2");
+        let result = if let Some(backend) = guard.as_compressible() {
             backend.decompress(data)
         } else {
             Ok(data.to_vec())
-        }
+        };
+        println!("TieredCache::decompress - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 }
 
 #[async_trait]
 impl EncryptableCache for TieredCache {
     async fn encrypt(&self, data: Vec<u8>, algorithm: EncryptionAlgorithm) -> Result<Vec<u8>, CacheError> {
+        println!("TieredCache::encrypt - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        if let Some(backend) = guard.as_encryptable() {
-            backend.encrypt(data, algorithm).await
+        println!("TieredCache::encrypt - Acquired blocking read lock on L2");
+        
+        let result = if let Some(backend) = guard.as_encryptable() {
+            let backend_result = backend.encrypt(data, algorithm).await;
+            println!("TieredCache::encrypt - Backend encryption completed");
+            backend_result
         } else {
             Err(CacheError::UnsupportedOperation("Encryption not supported".to_string()))
-        }
+        };
+        
+        println!("TieredCache::encrypt - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     async fn decrypt(&self, data: Vec<u8>, algorithm: EncryptionAlgorithm) -> Result<Vec<u8>, CacheError> {
+        println!("TieredCache::decrypt - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        if let Some(backend) = guard.as_encryptable() {
-            backend.decrypt(data, algorithm).await
+        println!("TieredCache::decrypt - Acquired blocking read lock on L2");
+        
+        let result = if let Some(backend) = guard.as_encryptable() {
+            let backend_result = backend.decrypt(data, algorithm).await;
+            println!("TieredCache::decrypt - Backend decryption completed");
+            backend_result
         } else {
             Err(CacheError::UnsupportedOperation("Decryption not supported".to_string()))
-        }
+        };
+        
+        println!("TieredCache::decrypt - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     fn is_encryption_ready(&self) -> bool {
+        println!("TieredCache::is_encryption_ready - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        guard.as_encryptable()
+        println!("TieredCache::is_encryption_ready - Acquired blocking read lock on L2");
+        
+        let result = guard.as_encryptable()
             .map(|backend| backend.is_encryption_ready())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        
+        println!("TieredCache::is_encryption_ready - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     fn supports_encryption(&self) -> bool {
+        println!("TieredCache::supports_encryption - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        guard.as_encryptable()
+        println!("TieredCache::supports_encryption - Acquired blocking read lock on L2");
+        
+        let result = guard.as_encryptable()
             .map(|backend| backend.supports_encryption())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        
+        println!("TieredCache::supports_encryption - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 
     fn supported_algorithms(&self) -> Vec<EncryptionAlgorithm> {
+        println!("TieredCache::supported_algorithms - Using blocking_read on L2 cache");
         let guard = self.l2_cache.blocking_read();
-        guard.as_encryptable()
+        println!("TieredCache::supported_algorithms - Acquired blocking read lock on L2");
+        
+        let result = guard.as_encryptable()
             .map(|backend| backend.supported_algorithms())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        
+        println!("TieredCache::supported_algorithms - Releasing blocking read lock on L2");
+        drop(guard);
+        result
     }
 } 

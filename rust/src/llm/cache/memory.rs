@@ -139,25 +139,51 @@ impl CacheBackend for MemoryCache {
         let entries = self.data.read();
         if let Some(entry) = entries.get(key) {
             if !self.is_expired(entry) {
+                // Increment hit counter
+                {
+                    let mut stats = self.stats.write();
+                    stats.hits += 1;
+                }
                 Ok(entry.clone())
             } else {
+                // Increment miss counter
+                {
+                    let mut stats = self.stats.write();
+                    stats.misses += 1;
+                }
                 Err(CacheError::NotFound)
             }
         } else {
+            // Increment miss counter
+            {
+                let mut stats = self.stats.write();
+                stats.misses += 1;
+            }
             Err(CacheError::NotFound)
         }
     }
     
     async fn set(&self, entry: CacheEntry) -> Result<(), CacheError> {
-        let mut entries = self.data.write();
-        entries.insert(entry.key.clone(), entry);
+        self.check_quota(entry.metadata.size_bytes).await?;
+        {
+            let mut entries = self.data.write();
+            entries.insert(entry.key.clone(), entry);
+        }
+        self.update_stats().await;
         Ok(())
     }
     
     async fn delete(&self, key: &str) -> Result<(), CacheError> {
-        let mut entries = self.data.write();
-        entries.remove(key);
-        Ok(())
+        let removed = {
+            let mut entries = self.data.write();
+            entries.remove(key)
+        };
+        if removed.is_some() {
+            self.update_stats().await;
+            Ok(())
+        } else {
+            Err(CacheError::NotFound)
+        }
     }
 
     async fn exists(&self, key: &str) -> Result<bool, CacheError> {
@@ -168,37 +194,61 @@ impl CacheBackend for MemoryCache {
     async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<CacheEntry>>, CacheError> {
         let entries = self.data.read();
         let mut results = Vec::with_capacity(keys.len());
+        let mut hits = 0;
+        let mut misses = 0;
+        
         for key in keys {
             if let Some(entry) = entries.get(key) {
                 if !self.is_expired(entry) {
                     results.push(Some(entry.clone()));
+                    hits += 1;
                     continue;
                 }
             }
             results.push(None);
+            misses += 1;
         }
+        
+        // Update stats
+        if hits > 0 || misses > 0 {
+            let mut stats = self.stats.write();
+            stats.hits += hits;
+            stats.misses += misses;
+        }
+        
         Ok(results)
     }
     
     async fn set_many(&self, entries: Vec<CacheEntry>) -> Result<(), CacheError> {
-        let mut cache_entries = self.data.write();
-        for entry in entries {
-            cache_entries.insert(entry.key.clone(), entry);
+        let total_new_size: usize = entries.iter().map(|entry| entry.metadata.size_bytes).sum();
+        self.check_quota(total_new_size).await?;
+        {
+            let mut cache_entries = self.data.write();
+            for entry in entries {
+                cache_entries.insert(entry.key.clone(), entry);
+            }
         }
+        self.update_stats().await;
         Ok(())
     }
     
     async fn delete_many(&self, keys: &[String]) -> Result<(), CacheError> {
-        let mut entries = self.data.write();
-        for key in keys {
-            entries.remove(key);
+        {
+            let mut entries = self.data.write();
+            for key in keys {
+                entries.remove(key);
+            }
         }
+        self.update_stats().await;
         Ok(())
     }
 
     async fn clear(&self) -> Result<(), CacheError> {
-        let mut entries = self.data.write();
-        entries.clear();
+        {
+            let mut entries = self.data.write();
+            entries.clear();
+        }
+        self.update_stats().await;
         Ok(())
     }
 
@@ -220,13 +270,15 @@ impl CacheBackend for MemoryCache {
     }
     
     async fn backup(&self, _path: &str) -> Result<(), CacheError> {
-        // In-memory cache doesn't support backup
-        Err(CacheError::Unavailable("Backup not supported for in-memory cache".into()))
+        // In-memory cache doesn't support backup, but should return Ok as a no-op
+        // instead of an error to support tiered cache patterns
+        Ok(())
     }
     
     async fn restore(&self, _path: &str) -> Result<(), CacheError> {
-        // In-memory cache doesn't support restore
-        Err(CacheError::Unavailable("Restore not supported for in-memory cache".into()))
+        // In-memory cache doesn't support restore, but should return Ok as a no-op
+        // instead of an error to support tiered cache patterns
+        Ok(())
     }
     
     async fn health_check(&self) -> Result<(), CacheError> {

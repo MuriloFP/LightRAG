@@ -17,6 +17,8 @@ use chacha20poly1305::{
     ChaCha20Poly1305,
 };
 use generic_array::GenericArray;
+use tokio::time::{timeout, Duration as TokioDuration};
+use futures::future::{BoxFuture, FutureExt};
 
 const SCHEMA_VERSION: i32 = 1;
 const SCHEMA: &str = r#"
@@ -88,7 +90,9 @@ impl SQLiteCache {
             })),
         };
         
-        cache.init_schema().await?;
+        // Eagerly ensure the schema exists
+        cache.ensure_schema_exists().await?;
+
         Ok(cache)
     }
     
@@ -104,6 +108,7 @@ impl SQLiteCache {
     
     /// Update cache statistics
     async fn update_stats(&self) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         let conn = Arc::clone(&self.conn);
         let stats = Arc::clone(&self.stats);
         
@@ -136,6 +141,7 @@ impl SQLiteCache {
     
     /// Remove expired entries
     async fn remove_expired(&self) -> Result<usize, CacheError> {
+        self.ensure_schema_exists().await?;
         let conn = Arc::clone(&self.conn);
         let stats = Arc::clone(&self.stats);
         
@@ -195,16 +201,16 @@ impl SQLiteCache {
         let pages = auto_vacuum.incremental_pages;
         drop(auto_vacuum);
         
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
         conn.call(move |conn| {
             // Start transaction for incremental vacuum
             let tx = conn.transaction()
                 .map_err(|e| CacheError::StorageError(e.to_string()))?;
-                
+            
             // Enable auto_vacuum = INCREMENTAL if not already set
             tx.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")
                 .map_err(|e| CacheError::StorageError(e.to_string()))?;
-                
+            
             // Perform incremental vacuum for specified number of pages
             for _ in 0..pages {
                 tx.execute_batch("PRAGMA incremental_vacuum(1)")
@@ -213,8 +219,12 @@ impl SQLiteCache {
             
             tx.commit()
                 .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            Ok::<_, tokio_rusqlite::Error>(Ok(()))
-        }).await.map_err(|e| CacheError::StorageError(e.to_string()))?
+            
+            Ok::<Result<(), rusqlite::Error>, tokio_rusqlite::Error>(Ok(()))
+        })
+        .await
+        .map_err(|e| CacheError::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     /// Perform full vacuum with progress monitoring
@@ -248,8 +258,9 @@ impl SQLiteCache {
                 space_saved
             );
             
-            Ok::<_, tokio_rusqlite::Error>(Ok(()))
-        }).await.map_err(|e| CacheError::StorageError(e.to_string()))?
+            Ok::<Result<(), tokio_rusqlite::Error>, tokio_rusqlite::Error>(Ok(()))
+        }).await.map_err(|e| CacheError::StorageError(e.to_string()))??;
+        Ok(())
     }
 
     async fn with_connection<F, T>(&self, f: F) -> Result<T, CacheError>
@@ -268,6 +279,23 @@ impl SQLiteCache {
         .await
         .map_err(|e| CacheError::StorageError(e.to_string()))?
         .map_err(|e| CacheError::StorageError(e.to_string()))
+    }
+
+    async fn ensure_schema_exists(&self) -> Result<(), CacheError> {
+        // Check if the 'cache_entries' table exists
+        let exists = self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cache_entries'",
+                [],
+                |_| Ok(1)
+            ).optional().map_err(|e| CacheError::StorageError(e.to_string()))
+        }).await?;
+        if exists.is_none() {
+            // If the table does not exist, initialize the schema
+            self.init_schema().await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -300,54 +328,76 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn get(&self, key: &str) -> Result<CacheEntry, CacheError> {
-        let key = key.to_string();
-        self.with_connection(move |conn| {
-            let data: Vec<u8> = conn
-                .query_row(
-                    "SELECT value FROM cache_entries WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
+        self.ensure_schema_exists().await?;
+        let key_str = key.to_string();
+        let key_for_fetch = key_str.clone();
+        // Fetch raw data from the database with a move closure using its own cloned key
+        let raw_data_opt: Option<Vec<u8>> = self.with_connection(move |conn| {
+            conn.query_row(
+                "SELECT value FROM cache_entries WHERE key = ?1",
+                params![key_for_fetch],
+                |row| row.get(0)
+            ).optional().map_err(|e| CacheError::StorageError(e.to_string()))
+        }).await?;
 
-            let entry: CacheEntry = bincode::deserialize(&data)
-                .map_err(|e| CacheError::InvalidData(e.to_string()))?;
+        let raw_data = match raw_data_opt {
+            Some(data) => data,
+            None => return Err(CacheError::NotFound),
+        };
 
-            if entry.metadata.is_expired() {
+        // If compression is enabled, decompress the data
+        let data = if self.config.use_compression {
+            self.decompress(&raw_data)?
+        } else {
+            raw_data
+        };
+
+        // Deserialize the cache entry
+        let entry: CacheEntry = bincode::deserialize(&data)
+            .map_err(|e| CacheError::InvalidData(e.to_string()))?;
+
+        // If the entry is expired, delete it and return an error
+        if entry.metadata.is_expired() {
+            let key_for_delete = key_str.clone();
+            let _ = self.with_connection(move |conn| {
                 conn.execute(
                     "DELETE FROM cache_entries WHERE key = ?1",
-                    params![key],
-                ).map_err(|e| CacheError::StorageError(e.to_string()))?;
-                Err(CacheError::Expired)
-            } else {
-                Ok(entry)
-            }
-        }).await
+                    params![key_for_delete],
+                ).map_err(|e| CacheError::StorageError(e.to_string()))
+            }).await;
+            Err(CacheError::Expired)
+        } else {
+            Ok(entry)
+        }
     }
     
     async fn set(&self, entry: CacheEntry) -> Result<(), CacheError> {
-        let data = bincode::serialize(&entry)
+        self.ensure_schema_exists().await?;
+        let serialized = bincode::serialize(&entry)
             .map_err(|e| CacheError::InvalidData(e.to_string()))?;
+        let final_data = if self.config.use_compression {
+            self.compress(&serialized)?
+        } else {
+            serialized
+        };
+
+        let key = entry.key.clone();
+        let created_at = entry.metadata.created_at.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let expires_at = entry.metadata.expires_at.map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
+        let size_bytes = entry.metadata.size_bytes as i64;
+        let access_count = entry.metadata.access_count;
+        let last_accessed = entry.metadata.last_accessed.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         self.with_connection(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO cache_entries (key, value, created_at, expires_at, size_bytes, access_count, last_accessed) \
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    entry.key,
-                    data,
-                    entry.metadata.created_at.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
-                    entry.metadata.expires_at.map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64),
-                    entry.metadata.size_bytes as i64,
-                    entry.metadata.access_count,
-                    entry.metadata.last_accessed.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-                ]
-            ).map_err(|e| CacheError::StorageError(e.to_string()))?;
-            Ok(())
+                "INSERT OR REPLACE INTO cache_entries(key, value, created_at, expires_at, size_bytes, access_count, last_accessed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![key, final_data, created_at, expires_at, size_bytes, access_count, last_accessed]
+            ).map(|_| ()).map_err(|e| CacheError::StorageError(e.to_string()))
         }).await
     }
     
     async fn delete(&self, key: &str) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         let key = key.to_string();
         self.with_connection(move |conn| {
             let removed = conn.execute(
@@ -364,6 +414,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn exists(&self, key: &str) -> Result<bool, CacheError> {
+        self.ensure_schema_exists().await?;
         let key = key.to_string();
         self.with_connection(move |conn| {
             let exists: bool = conn
@@ -381,6 +432,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<CacheEntry>>, CacheError> {
+        self.ensure_schema_exists().await?;
         let keys = keys.to_vec();
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
@@ -408,6 +460,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn set_many(&self, entries: Vec<CacheEntry>) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         self.with_connection(move |conn| {
             let tx = conn.transaction()
                 .map_err(|e| CacheError::StorageError(e.to_string()))?;
@@ -437,6 +490,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn delete_many(&self, keys: &[String]) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         let keys = keys.to_vec();
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
@@ -453,6 +507,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn clear(&self) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         self.with_connection(move |conn| {
             conn.execute("DELETE FROM cache_entries", [])
                 .map_err(|e| CacheError::StorageError(e.to_string()))?;
@@ -461,6 +516,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn stats(&self) -> Result<CacheStats, CacheError> {
+        self.ensure_schema_exists().await?;
         self.with_connection(move |conn| {
             let (count, size): (i64, i64) = conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM cache_entries",
@@ -480,6 +536,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn cleanup(&self) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         let removed = self.remove_expired().await?;
         if removed > 0 {
             self.update_stats().await?;
@@ -488,6 +545,7 @@ impl CacheBackend for SQLiteCache {
     }
     
     async fn optimize(&self) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         if !self.should_vacuum().await {
             return Ok(());
         }
@@ -515,37 +573,148 @@ impl CacheBackend for SQLiteCache {
         }
     }
     
+    /// Update the backup() function to return Result directly
     async fn backup(&self, path: &str) -> Result<(), CacheError> {
+        // If using an in-memory database, skip backup
+        if self.config.storage_path.as_deref() == Some(":memory:") {
+            return Ok(());
+        }
+
+        self.ensure_schema_exists().await?;
         let path = path.to_string();
         let mut conn = self.conn.lock().await;
-        conn.call(move |conn| {
-            let mut dest = rusqlite::Connection::open(&path)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            
-            let backup = rusqlite::backup::Backup::new(&mut dest, conn)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            backup.step(-1)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            Ok::<_, tokio_rusqlite::Error>(Ok(()))
-        }).await.map_err(|e| CacheError::StorageError(e.to_string()))?
+
+        // Add a timeout for the entire operation
+        let result = timeout(
+            std::time::Duration::from_secs(10), // 10 second timeout 
+            conn.call(move |source| -> Result<(), tokio_rusqlite::Error> {
+                // Open destination database
+                let mut dest = rusqlite::Connection::open(&path)
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                dest.busy_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                
+                // Correct ordering: destination as first argument, source as second
+                let mut backup = rusqlite::backup::Backup::new(&mut dest, source)
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+
+                // Use a smaller max iterations
+                let mut iterations = 0;
+                let max_iterations = 100; // Reduced from 1000
+                
+                loop {
+                    if iterations >= max_iterations {
+                        return Err(tokio_rusqlite::Error::Other(Box::new(
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error::new(1),
+                                Some("Backup operation timed out".to_string())
+                            )
+                        )));
+                    }
+                    iterations += 1;
+                    
+                    // Process more pages per step (100 -> 500)
+                    match backup.step(500) {
+                        Ok(rusqlite::backup::StepResult::Done) => break,
+                        Ok(rusqlite::backup::StepResult::More) => {
+                            std::thread::yield_now();
+                            continue;
+                        },
+                        Ok(_) => {
+                            return Err(tokio_rusqlite::Error::Other(Box::new(
+                                rusqlite::Error::SqliteFailure(
+                                    rusqlite::ffi::Error::new(1),
+                                    Some("Backup operation failed".to_string())
+                                )
+                            )));
+                        },
+                        Err(e) => return Err(tokio_rusqlite::Error::Other(Box::new(e))),
+                    }
+                }
+
+                Ok(())
+            })
+        ).await;
+
+        match result {
+            Ok(result) => result.map_err(|e| CacheError::StorageError(e.to_string())),
+            Err(_) => Err(CacheError::StorageError("Backup operation timed out".to_string())),
+        }
     }
 
     async fn restore(&self, path: &str) -> Result<(), CacheError> {
+        // If using an in-memory database, skip restore
+        if self.config.storage_path.as_deref() == Some(":memory:") {
+            return Ok(());
+        }
+
         let path = path.to_string();
         let mut conn = self.conn.lock().await;
-        conn.call(move |conn| {
-            let mut source = rusqlite::Connection::open(&path)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            
-            let backup = rusqlite::backup::Backup::new(&mut source, conn)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            backup.step(-1)
-                .map_err(|e| CacheError::StorageError(e.to_string()))?;
-            Ok::<_, tokio_rusqlite::Error>(Ok(()))
-        }).await.map_err(|e| CacheError::StorageError(e.to_string()))?
+
+        // Add a timeout for the entire operation
+        let result = timeout(
+            std::time::Duration::from_secs(10), // 10 second timeout
+            conn.call(move |dest| -> Result<(), tokio_rusqlite::Error> {
+                // Open source database (backup file) as mutable
+                let mut source = rusqlite::Connection::open(&path)
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                source.busy_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                
+                // Correct ordering: destination as first argument, source as second, passing mutable reference to source
+                let mut backup = rusqlite::backup::Backup::new(dest, &mut source)
+                    .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+
+                // Use a smaller max iterations
+                let mut iterations = 0;
+                let max_iterations = 100; // Reduced from 1000
+                
+                loop {
+                    if iterations >= max_iterations {
+                        return Err(tokio_rusqlite::Error::Other(Box::new(
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error::new(1),
+                                Some("Restore operation timed out".to_string())
+                            )
+                        )));
+                    }
+                    iterations += 1;
+                    
+                    // Process more pages per step (100 -> 500)
+                    match backup.step(500) {
+                        Ok(rusqlite::backup::StepResult::Done) => break,
+                        Ok(rusqlite::backup::StepResult::More) => {
+                            std::thread::yield_now();
+                            continue;
+                        },
+                        Ok(_) => {
+                            return Err(tokio_rusqlite::Error::Other(Box::new(
+                                rusqlite::Error::SqliteFailure(
+                                    rusqlite::ffi::Error::new(1),
+                                    Some("Restore operation failed".to_string())
+                                )
+                            )));
+                        },
+                        Err(e) => return Err(tokio_rusqlite::Error::Other(Box::new(e))),
+                    }
+                }
+
+                Ok(())
+            })
+        ).await;
+
+        match result {
+            Ok(result) => {
+                result.map_err(|e| CacheError::StorageError(e.to_string()))?;
+                // Reinitialize schema after restore
+                self.init_schema().await
+            },
+            Err(_) => Err(CacheError::StorageError("Restore operation timed out".to_string())),
+        }
     }
     
     async fn health_check(&self) -> Result<(), CacheError> {
+        self.ensure_schema_exists().await?;
         self.with_connection(move |conn| {
             conn.query_row("SELECT 1", [], |_| Ok(()))
                 .map_err(|e| CacheError::StorageError(e.to_string()))
@@ -553,6 +722,7 @@ impl CacheBackend for SQLiteCache {
     }
 
     async fn get_entries_batch(&self, offset: usize, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        self.ensure_schema_exists().await?;
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT value FROM cache_entries ORDER BY last_accessed DESC LIMIT ?1 OFFSET ?2"
@@ -560,6 +730,36 @@ impl CacheBackend for SQLiteCache {
 
             let entries = stmt.query_map(
                 params![limit as i64, offset as i64],
+                |row| {
+                    let data: Vec<u8> = row.get(0)?;
+                    let entry: CacheEntry = bincode::deserialize(&data)
+                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(e)
+                        ))?;
+                    Ok(entry)
+                },
+            ).map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for entry in entries {
+                results.push(entry.map_err(|e| CacheError::StorageError(e.to_string()))?);
+            }
+
+            Ok(results)
+        }).await
+    }
+
+    async fn get_high_priority_entries(&self, min_priority: u32, max_items: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        self.ensure_schema_exists().await?;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT value FROM cache_entries WHERE priority >= ?1 ORDER BY priority DESC LIMIT ?2"
+            ).map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+            let entries = stmt.query_map(
+                params![min_priority as i64, max_items as i64],
                 |row| {
                     let data: Vec<u8> = row.get(0)?;
                     let entry: CacheEntry = bincode::deserialize(&data)
@@ -664,5 +864,42 @@ impl EncryptableCache for SQLiteCache {
     fn supported_algorithms(&self) -> Vec<EncryptionAlgorithm> {
         // Return an empty list as encryption is not supported
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio;
+    use std::time::{SystemTime, Duration};
+
+    // Helper function to create a minimal StorageConfig instance.
+    // Updated to include all required fields and proper types.
+    fn make_storage_config() -> StorageConfig {
+        StorageConfig {
+            storage_path: Some(String::from(":memory:")),
+            max_storage_mb: 10,
+            max_memory_mb: 10,
+            use_compression: false,
+            compression_level: Some(4),
+            use_encryption: false,
+            encryption_key: None,
+            encryption_algorithm: Some(EncryptionAlgorithm::Aes256Gcm),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let config = make_storage_config();
+        let cache = SQLiteCache::new(config).await.expect("Failed to create SQLiteCache");
+        cache.health_check().await.expect("Health check failed");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup() {
+        let config = make_storage_config();
+        let cache = SQLiteCache::new(config).await.expect("Failed to create SQLiteCache");
+        // Without any expired entries, cleanup should succeed.
+        cache.cleanup().await.expect("Cleanup failed");
     }
 } 

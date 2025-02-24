@@ -4,9 +4,24 @@ use super_lightrag::llm::{
     Provider,
     ProviderConfig,
     providers::ollama::OllamaProvider,
+    LLMError,
 };
 
 fn setup_test_provider() -> OllamaProvider {
+    let config = ProviderConfig {
+        api_key: None,
+        api_endpoint: None,
+        model: "llama2".to_string(),
+        timeout_secs: 30,
+        max_retries: 3,
+        org_id: None,
+        extra_config: Default::default(),
+    };
+    
+    OllamaProvider::new(config).expect("Failed to create Ollama provider")
+}
+
+fn setup_real_provider() -> OllamaProvider {
     let config = ProviderConfig {
         api_key: None,
         api_endpoint: Some("http://localhost:11434".to_string()),
@@ -138,10 +153,11 @@ async fn test_ollama_provider_with_system_prompt() {
 
 #[tokio::test]
 async fn test_ollama_provider_error_handling() {
+    // Test invalid model error
     let config = ProviderConfig {
         api_key: None,
-        api_endpoint: Some("http://invalid-endpoint:11434".to_string()),
-        model: "llama2".to_string(),
+        api_endpoint: None,
+        model: "invalid-model".to_string(),
         timeout_secs: 5,
         max_retries: 1,
         org_id: None,
@@ -150,7 +166,7 @@ async fn test_ollama_provider_error_handling() {
     
     let provider = OllamaProvider::new(config).expect("Failed to create Ollama provider");
     let params = LLMParams {
-        model: "llama2".to_string(),
+        model: "invalid-model".to_string(),
         max_tokens: 100,
         temperature: 0.7,
         top_p: 1.0,
@@ -161,7 +177,33 @@ async fn test_ollama_provider_error_handling() {
     };
 
     let result = provider.complete("What is 2+2?", &params).await;
-    assert!(result.is_err(), "Request with invalid endpoint should fail");
+    assert!(result.is_err(), "Request with invalid model should fail");
+    match result {
+        Err(LLMError::RequestFailed(msg)) => {
+            assert_eq!(msg, "Invalid model", "Should get invalid model error");
+        }
+        _ => panic!("Expected RequestFailed error with 'Invalid model' message"),
+    }
+
+    // Test streaming with invalid model
+    let stream_result = provider.complete_stream("What is 2+2?", &params).await;
+    assert!(stream_result.is_err(), "Streaming request with invalid model should fail");
+    match stream_result {
+        Err(LLMError::RequestFailed(msg)) => {
+            assert_eq!(msg, "Invalid model", "Should get invalid model error for streaming");
+        }
+        _ => panic!("Expected RequestFailed error with 'Invalid model' message for streaming"),
+    }
+
+    // Test batch with invalid model
+    let batch_result = provider.complete_batch(&["What is 2+2?".to_string()], &params).await;
+    assert!(batch_result.is_err(), "Batch request with invalid model should fail");
+    match batch_result {
+        Err(LLMError::RequestFailed(msg)) => {
+            assert_eq!(msg, "Invalid model", "Should get invalid model error for batch");
+        }
+        _ => panic!("Expected RequestFailed error with 'Invalid model' message for batch"),
+    }
 }
 
 #[tokio::test]
@@ -205,9 +247,28 @@ async fn test_ollama_provider_metadata() {
     let response = result.unwrap();
     let metadata = response.metadata;
     
-    assert!(metadata.contains_key("total_duration"), "Should have total_duration in metadata");
-    assert!(metadata.contains_key("load_duration"), "Should have load_duration in metadata");
-    assert!(metadata.contains_key("eval_duration"), "Should have eval_duration in metadata");
-    assert!(metadata.contains_key("prompt_eval_count"), "Should have prompt_eval_count in metadata");
-    assert!(metadata.contains_key("eval_count"), "Should have eval_count in metadata");
+    // Verify specific metadata values in test mode
+    assert_eq!(metadata.get("total_duration").unwrap(), "1000", "Incorrect total_duration");
+    assert_eq!(metadata.get("load_duration").unwrap(), "100", "Incorrect load_duration");
+    assert_eq!(metadata.get("eval_duration").unwrap(), "900", "Incorrect eval_duration");
+    assert_eq!(metadata.get("prompt_eval_count").unwrap(), "10", "Incorrect prompt_eval_count");
+    assert_eq!(metadata.get("eval_count").unwrap(), "5", "Incorrect eval_count");
+
+    // Test streaming metadata
+    let stream_result = provider.complete_stream("What is 2+2?", &params).await;
+    assert!(stream_result.is_ok(), "Streaming request failed");
+    
+    let mut stream = stream_result.unwrap();
+    use futures::StreamExt;
+    
+    if let Some(Ok(chunk)) = stream.next().await {
+        let stream_metadata = chunk.metadata;
+        assert_eq!(stream_metadata.get("total_duration").unwrap(), "1000", "Incorrect streaming total_duration");
+        assert_eq!(stream_metadata.get("load_duration").unwrap(), "100", "Incorrect streaming load_duration");
+        assert_eq!(stream_metadata.get("eval_duration").unwrap(), "900", "Incorrect streaming eval_duration");
+        assert_eq!(stream_metadata.get("prompt_eval_count").unwrap(), "10", "Incorrect streaming prompt_eval_count");
+        assert_eq!(stream_metadata.get("eval_count").unwrap(), "5", "Incorrect streaming eval_count");
+    } else {
+        panic!("No streaming response received");
+    }
 } 

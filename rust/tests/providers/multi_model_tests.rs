@@ -184,20 +184,21 @@ async fn test_multi_model_batch() {
 
 #[tokio::test]
 async fn test_multi_model_error_handling() {
-    let mut openai_config = ProviderConfig {
+    // Set up configurations with invalid credentials
+    let openai_config = ProviderConfig {
         api_key: Some("invalid_key".to_string()),
         api_endpoint: Some("https://api.openai.com".to_string()),
-        model: "gpt-3.5-turbo".to_string(),
+        model: "invalid-model".to_string(), // Using invalid-model to trigger real errors
         timeout_secs: 30,
         max_retries: 1,
         org_id: None,
         extra_config: Default::default(),
     };
     
-    let mut anthropic_config = ProviderConfig {
+    let anthropic_config = ProviderConfig {
         api_key: Some("invalid_key".to_string()),
         api_endpoint: Some("https://api.anthropic.com".to_string()),
-        model: "claude-2".to_string(),
+        model: "invalid-model".to_string(), // Using invalid-model to trigger real errors
         timeout_secs: 30,
         max_retries: 1,
         org_id: None,
@@ -207,13 +208,14 @@ async fn test_multi_model_error_handling() {
     let ollama_config = ProviderConfig {
         api_key: None,
         api_endpoint: Some("http://invalid-endpoint:11434".to_string()),
-        model: "llama2".to_string(),
+        model: "invalid-model".to_string(), // Using invalid-model to trigger real errors
         timeout_secs: 5,
         max_retries: 1,
         org_id: None,
         extra_config: Default::default(),
     };
 
+    println!("Creating multi_model with all invalid configs");
     let multi_model = MultiModelBuilder::new()
         .add_model("openai", openai_config.clone())
         .unwrap()
@@ -234,13 +236,23 @@ async fn test_multi_model_error_handling() {
         query_params: None,
     };
 
+    println!("Attempting completion with all invalid configs");
     let result = multi_model.complete("What is 2+2?", &params).await;
+    println!("Result with all invalid configs: {:?}", result);
     assert!(result.is_err(), "Request with all invalid configs should fail");
 
     // Test with one valid config
-    openai_config.api_key = env::var("OPENAI_API_KEY").ok();
+    println!("Setting up with one potentially valid OpenAI config from env var");
+    let api_key = env::var("OPENAI_API_KEY").ok();
+    println!("Got API key from env: {}", api_key.is_some());
+    
+    let mut openai_config_valid = openai_config.clone();
+    openai_config_valid.api_key = api_key;
+    openai_config_valid.model = "gpt-3.5-turbo".to_string(); // Valid model name
+    
+    println!("Creating multi_model with one potentially valid config");
     let multi_model = MultiModelBuilder::new()
-        .add_model("openai", openai_config)
+        .add_model("openai", openai_config_valid)
         .unwrap()
         .add_model("anthropic", anthropic_config)
         .unwrap()
@@ -248,6 +260,8 @@ async fn test_multi_model_error_handling() {
         .unwrap()
         .build();
 
+    println!("Attempting completion with one potentially valid config");
     let result = multi_model.complete("What is 2+2?", &params).await;
+    println!("Result with one potentially valid config: {:?}", result);
     assert!(result.is_ok(), "Request should succeed with one valid config");
 } 

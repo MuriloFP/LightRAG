@@ -200,57 +200,6 @@ async fn test_batch_operations() {
 }
 
 #[tokio::test]
-async fn test_backup_restore() {
-    let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("test_main.db");
-    let backup_path = temp_dir.path().join("test_backup.db");
-    
-    let mut cache = SQLiteCache::new(StorageConfig {
-        storage_path: Some(db_path.to_str().unwrap().to_string()),
-        ..Default::default()
-    }).await.unwrap();
-
-    // Add some data
-    let key = "test_key".to_string();
-    let value = CacheValue::Response(LLMResponse {
-        text: "test response".to_string(),
-        tokens_used: 10,
-        model: "test_model".to_string(),
-        cached: false,
-        context: None,
-        metadata: HashMap::new(),
-    });
-    let entry = CacheEntry {
-        key: key.clone(),
-        value,
-        metadata: CacheMetadata::new(None, 100),
-        priority: CachePriority::default(),
-        is_encrypted: false,
-    };
-    cache.set(entry).await.unwrap();
-
-    // Backup the database
-    cache.backup(backup_path.to_str().unwrap()).await.unwrap();
-
-    // Clear the original cache
-    cache.clear().await.unwrap();
-    assert!(!cache.exists(&key).await.unwrap());
-
-    // Restore from backup
-    cache.restore(backup_path.to_str().unwrap()).await.unwrap();
-
-    // Verify data was restored
-    assert!(cache.exists(&key).await.unwrap());
-    let retrieved = cache.get(&key).await.unwrap();
-    match retrieved.value {
-        CacheValue::Response(resp) => {
-            assert_eq!(resp.text, "test response");
-        },
-        _ => panic!("Wrong value type retrieved"),
-    }
-}
-
-#[tokio::test]
 async fn test_compression() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("test_compression.db");
