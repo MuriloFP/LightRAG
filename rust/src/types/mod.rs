@@ -24,8 +24,11 @@ pub mod llm;
 /// - Error types specific to embedding operations
 pub mod embeddings;
 
+pub mod error;
+
 // Re-exports
-pub use llm::{LLMClient, LLMConfig, LLMParams, LLMResponse, LLMError};
+pub use error::{Error, Result};
+pub use llm::{LLMParams, LLMResponse, LLMError};
 pub use embeddings::{EmbeddingProvider, EmbeddingConfig, EmbeddingError, EmbeddingResponse};
 
 /// A node in the knowledge graph with its properties and labels.
@@ -62,45 +65,6 @@ pub struct KnowledgeGraph {
     /// List of edges connecting the nodes.
     pub edges: Vec<KnowledgeGraphEdge>,
 }
-
-/// Custom error type for SuperLightRAG operations
-#[derive(Error, Debug)]
-pub enum Error {
-    /// IO errors
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// JSON serialization/deserialization errors
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    /// Storage errors
-    #[error("Storage error: {0}")]
-    Storage(String),
-
-    /// Vector storage specific errors
-    #[error("Vector storage error: {0}")]
-    VectorStorage(String),
-
-    /// API errors
-    #[error("API error: {0}")]
-    Api(String),
-
-    /// Configuration errors
-    #[error("Configuration error: {0}")]
-    Config(String),
-
-    /// Invalid input errors
-    #[error("Invalid input: {0}")]
-    InvalidInput(String),
-
-    /// XML errors
-    #[error("XML error: {0}")]
-    Xml(#[from] quick_xml::Error),
-}
-
-/// Result type for SuperLightRAG operations
-pub type Result<T> = std::result::Result<T, Error>;
 
 /// Configuration for SuperLightRAG
 #[derive(Debug, Clone, Serialize, Deserialize)]

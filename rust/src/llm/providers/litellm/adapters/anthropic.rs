@@ -7,29 +7,30 @@ use std::sync::Arc;
 
 use crate::llm::{
     LLMError, LLMParams, LLMResponse,
-    LLMConfig,
+    Provider,
+    ProviderConfig,
 };
-use crate::types::llm::{StreamingResponse, LLMClient};
-use crate::llm::providers::anthropic::AnthropicClient;
+use crate::types::llm::StreamingResponse;
+use crate::llm::providers::anthropic::AnthropicProvider;
 use crate::llm::ProviderAdapter;
 use crate::llm::LLMProvider;
 
 /// Anthropic provider adapter implementation
 pub struct AnthropicAdapter {
-    client: AnthropicClient,
-    config: Arc<LLMConfig>,
+    provider: AnthropicProvider,
+    config: Arc<ProviderConfig>,
 }
 
 impl AnthropicAdapter {
     /// Create a new Anthropic adapter
-    pub fn new(client: AnthropicClient, config: LLMConfig) -> Result<Self, LLMError> {
+    pub fn new(client: AnthropicProvider, config: ProviderConfig) -> Result<Self, LLMError> {
         // Validate configuration
         if config.api_key.is_none() {
             return Err(LLMError::ConfigError("Anthropic API key is required".to_string()));
         }
 
         Ok(Self { 
-            client,
+            provider: client,
             config: Arc::new(config),
         })
     }
@@ -73,15 +74,13 @@ impl AnthropicAdapter {
 }
 
 #[async_trait]
-impl ProviderAdapter for AnthropicAdapter {
-    async fn complete(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        // Validate parameters
-        self.validate_params(params)?;
+impl Provider for AnthropicAdapter {
+    async fn initialize(&mut self) -> Result<(), LLMError> {
+        self.provider.initialize().await
+    }
 
-        // Call Anthropic client and map errors
-        self.client.generate(prompt, params)
-            .await
-            .map_err(|e| self.map_error(e))
+    async fn complete(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
+        self.provider.complete(prompt, params).await
     }
 
     async fn complete_stream(
@@ -89,50 +88,31 @@ impl ProviderAdapter for AnthropicAdapter {
         prompt: &str,
         params: &LLMParams,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
-        // Validate parameters
-        self.validate_params(params)?;
-
-        // Create streaming channel
-        let (tx, rx) = mpsc::channel(32);
-        let mut stream = self.client.generate_stream(prompt, params)
-            .await
-            .map_err(|e| self.map_error(e))?;
-
-        // Clone necessary data for error mapping
-        let provider_name = self.provider_name().to_string();
-        let error_mapper = move |e| {
-            match e {
-                LLMError::RequestFailed(msg) => LLMError::RequestFailed(format!("{} API error: {}", provider_name, msg)),
-                LLMError::RateLimitExceeded(msg) => LLMError::RateLimitExceeded(format!("{} rate limit: {}", provider_name, msg)),
-                LLMError::TokenLimitExceeded(msg) => LLMError::TokenLimitExceeded(format!("{} token limit: {}", provider_name, msg)),
-                LLMError::InvalidResponse(msg) => LLMError::InvalidResponse(format!("{} invalid response: {}", provider_name, msg)),
-                LLMError::ConfigError(msg) => LLMError::ConfigError(format!("{} config error: {}", provider_name, msg)),
-                LLMError::CacheError(msg) => LLMError::CacheError(format!("{} cache error: {}", provider_name, msg)),
-            }
-        };
-        
-        // Spawn task to handle streaming
-        tokio::spawn(async move {
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(chunk) => {
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(error_mapper(e))).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        self.provider.complete_stream(prompt, params).await
     }
 
+    async fn complete_batch(
+        &self,
+        prompts: &[String],
+        params: &LLMParams,
+    ) -> Result<Vec<LLMResponse>, LLMError> {
+        self.provider.complete_batch(prompts, params).await
+    }
+
+    fn get_config(&self) -> &ProviderConfig {
+        &self.config
+    }
+
+    fn update_config(&mut self, config: ProviderConfig) -> Result<(), LLMError> {
+        self.config = Arc::new(config);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for AnthropicAdapter {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LLMError> {
-        self.client.create_embeddings(texts).await
+        self.provider.create_embeddings(texts).await
     }
 
     fn supports_streaming(&self) -> bool {
@@ -146,9 +126,5 @@ impl ProviderAdapter for AnthropicAdapter {
 
     fn provider_name(&self) -> &str {
         "Anthropic"
-    }
-
-    fn get_config(&self) -> &LLMConfig {
-        self.config.as_ref()
     }
 } 

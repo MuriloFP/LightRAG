@@ -1,463 +1,396 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, Duration};
+use parking_lot::RwLock;
 use async_trait::async_trait;
-use futures::{Stream, stream};
-use std::pin::Pin;
-use tokio::sync::RwLock;
-use crate::llm::{LLMError, LLMResponse};
-use crate::types::llm::StreamingResponse;
-use super::{ResponseCache, CacheConfig, CacheEntry, CacheMetrics};
-use super::types::CacheType;
+use super::backend::{CacheBackend, CompressibleCache, EncryptableCache, CacheError, CacheCapabilities, EncryptionAlgorithm};
+use super::types::{CacheEntry, CacheStats, CacheType, StorageConfig, CacheValue};
+use crate::llm::LLMResponse;
+use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use rand;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce as AesNonce
+};
+use chacha20poly1305::{
+    aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit},
+    ChaCha20Poly1305, Nonce as ChaChaPolNonce
+};
+use rand::RngCore;
+use std::any::Any;
 
-/// In-memory implementation of ResponseCache
-pub struct InMemoryCache {
-    /// Cache entries
-    entries: Arc<RwLock<HashMap<String, CacheEntry>>>,
-    
-    /// Cache configuration
-    config: CacheConfig,
-    
-    /// Cache metrics
-    metrics: Arc<CacheMetrics>,
+/// In-memory cache implementation
+pub struct MemoryCache {
+    data: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    config: StorageConfig,
+    stats: Arc<RwLock<CacheStats>>,
 }
 
-impl Default for InMemoryCache {
-    fn default() -> Self {
+impl MemoryCache {
+    /// Create a new memory cache
+    pub fn new() -> Self {
         Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            config: CacheConfig::default(),
-            metrics: Arc::new(CacheMetrics::default()),
+            data: Arc::new(RwLock::new(HashMap::new())),
+            config: StorageConfig::default(),
+            stats: Arc::new(RwLock::new(CacheStats::default())),
         }
     }
-}
-
-impl InMemoryCache {
-    /// Create a new in-memory cache
-    pub fn new(config: CacheConfig) -> Self {
-        Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            config,
-            metrics: Arc::new(CacheMetrics::default()),
+    
+    /// Update cache statistics
+    async fn update_stats(&self) {
+        let storage = self.data.read();
+        let mut stats = self.stats.write();
+        
+        stats.item_count = storage.len();
+        stats.total_size_bytes = storage
+            .values()
+            .map(|entry| entry.metadata.size_bytes)
+            .sum();
+    }
+    
+    /// Check storage quota
+    async fn check_quota(&self, new_size: usize) -> Result<(), CacheError> {
+        let stats = self.stats.read();
+        let total_size_mb = (stats.total_size_bytes + new_size) as f64 / 1024.0 / 1024.0;
+        
+        if total_size_mb > self.config.max_storage_mb as f64 {
+            Err(CacheError::QuotaExceeded)
+        } else {
+            Ok(())
         }
+    }
+    
+    /// Remove expired entries
+    async fn remove_expired(&self) -> usize {
+        let mut storage = self.data.write();
+        let before_len = storage.len();
+        
+        storage.retain(|_, entry| !self.is_expired(entry));
+        
+        let removed = before_len - storage.len();
+        if removed > 0 {
+            let mut stats = self.stats.write();
+            stats.expirations += removed as u64;
+        }
+        
+        removed
     }
 
     /// Check if an entry is expired
-    pub fn is_expired(&self, entry: &CacheEntry) -> bool {
-        if let Some(expires_at) = entry.expires_at {
-            SystemTime::now() > expires_at
-        } else {
-            false
-        }
+    fn is_expired(&self, entry: &CacheEntry) -> bool {
+        entry.metadata.is_expired()
     }
 
-    /// Find similar entry using vector similarity
-    pub async fn find_similar(&self, embedding: Vec<f32>, threshold: f32) -> Option<LLMResponse> {
-        if !self.config.similarity_enabled {
-            return None;
-        }
-
-        let entries = self.entries.read().await;
-        let mut best_match = None;
-        let mut best_similarity = threshold;
-
-        for entry in entries.values() {
-            if let Some(entry_embedding) = &entry.embedding {
-                let similarity = cosine_similarity(&embedding, entry_embedding);
-                if similarity > best_similarity {
-                    best_similarity = similarity;
-                    best_match = Some(entry.response.clone());
-                }
-            }
-        }
-
-        best_match
-    }
-
-    /// Store an entry with embedding
-    pub async fn put_with_embedding(&self, prompt: &str, response: LLMResponse, embedding: Vec<f32>) -> Result<(), LLMError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let mut entries = self.entries.write().await;
-        let mut entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
-        entry.embedding = Some(embedding);
-        entries.insert(prompt.to_string(), entry);
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn build_key(&self, prompt: &str) -> String {
-        format!("{}:{}:{}",
-            self.config.prefix,
-            self.config.cache_type.as_str(),
-            prompt
-        )
-    }
-
-    pub async fn put(&self, prompt: &str, response: LLMResponse) -> Result<(), LLMError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let key = self.build_key(prompt);
-        let mut entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
+    /// Get a batch of entries starting from an offset
+    pub async fn get_entries_batch(&self, offset: usize, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        let entries = self.data.read();
+        let mut result = Vec::new();
         
-        if self.config.use_compression {
-            entry.compress()?;
-        }
-        
-        if self.config.validate_integrity {
-            entry.set_checksum()?;
-        }
-
-        let mut entries = self.entries.write().await;
-        entries.insert(key, entry);
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub async fn get(&self, prompt: &str) -> Option<LLMResponse> {
-        if !self.config.enabled {
-            return None;
-        }
-
-        let key = self.build_key(prompt);
-        let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(&key) {
+        for (_, entry) in entries.iter().skip(offset).take(limit) {
             if !self.is_expired(entry) {
-                self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(entry.response.clone());
+                result.push(entry.clone());
             }
         }
-        self.metrics.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        None
+        
+        Ok(result)
     }
 
-    pub async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError> {
-        if !self.config.enabled || !self.config.stream_cache_enabled {
-            return Ok(());
-        }
-
-        let key = self.build_key(prompt);
-        let entry = CacheEntry::new_streaming(chunks, self.config.stream_ttl, Some(self.config.cache_type.clone()));
-        let mut entries = self.entries.write().await;
-        entries.insert(key, entry);
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>> {
-        if !self.config.enabled || !self.config.stream_cache_enabled {
-            return None;
-        }
-
-        let key = self.build_key(prompt);
-        let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(&key) {
-            if !self.is_expired(entry) && entry.is_streaming() {
-                if let Some(chunks) = entry.get_chunks() {
-                    self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let chunks = chunks.to_vec();
-                    return Some(Box::pin(stream::iter(chunks.into_iter().map(Ok))));
+    /// Get high priority entries above a threshold
+    pub async fn get_high_priority_entries(&self, min_priority: u32, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        let entries = self.data.read();
+        let mut result = Vec::new();
+        
+        for (_, entry) in entries.iter() {
+            if !self.is_expired(entry) && entry.priority as u32 >= min_priority {
+                result.push(entry.clone());
+                if result.len() >= limit {
+                    break;
                 }
             }
         }
-        self.metrics.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        None
-    }
-
-    pub async fn cleanup(&self) -> Result<(), LLMError> {
-        let mut entries = self.entries.write().await;
-        let before_len = entries.len();
-        entries.retain(|_, entry| !self.is_expired(entry));
-        let removed = before_len - entries.len();
         
-        if removed > 0 {
-            self.metrics.size.fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl CacheBackend for MemoryCache {
+    fn backend_type(&self) -> CacheType {
+        CacheType::Memory
+    }
+    
+    fn capabilities(&self) -> CacheCapabilities {
+        CacheCapabilities {
+            persistent: false,
+            streaming: true,
+            compression: true,
+            encryption: false,
+            transactions: false,
+            pubsub: false,
         }
-        Ok(())
     }
-
-    pub async fn clear(&self) -> Result<(), LLMError> {
-        let mut entries = self.entries.write().await;
-        entries.clear();
-        self.metrics.size.store(0, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn get_config(&self) -> &CacheConfig {
-        &self.config
-    }
-
-    pub fn update_config(&mut self, config: CacheConfig) -> Result<(), LLMError> {
+    
+    async fn initialize(&mut self, config: StorageConfig) -> Result<(), CacheError> {
         self.config = config;
         Ok(())
     }
+
+    async fn get(&self, key: &str) -> Result<CacheEntry, CacheError> {
+        let entries = self.data.read();
+        if let Some(entry) = entries.get(key) {
+            if !self.is_expired(entry) {
+                Ok(entry.clone())
+            } else {
+                Err(CacheError::NotFound)
+            }
+        } else {
+            Err(CacheError::NotFound)
+        }
+    }
+    
+    async fn set(&self, entry: CacheEntry) -> Result<(), CacheError> {
+        let mut entries = self.data.write();
+        entries.insert(entry.key.clone(), entry);
+        Ok(())
+    }
+    
+    async fn delete(&self, key: &str) -> Result<(), CacheError> {
+        let mut entries = self.data.write();
+        entries.remove(key);
+        Ok(())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, CacheError> {
+        let entries = self.data.read();
+        Ok(entries.contains_key(key))
+    }
+    
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<CacheEntry>>, CacheError> {
+        let entries = self.data.read();
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(entry) = entries.get(key) {
+                if !self.is_expired(entry) {
+                    results.push(Some(entry.clone()));
+                    continue;
+                }
+            }
+            results.push(None);
+        }
+        Ok(results)
+    }
+    
+    async fn set_many(&self, entries: Vec<CacheEntry>) -> Result<(), CacheError> {
+        let mut cache_entries = self.data.write();
+        for entry in entries {
+            cache_entries.insert(entry.key.clone(), entry);
+        }
+        Ok(())
+    }
+    
+    async fn delete_many(&self, keys: &[String]) -> Result<(), CacheError> {
+        let mut entries = self.data.write();
+        for key in keys {
+            entries.remove(key);
+        }
+        Ok(())
+    }
+
+    async fn clear(&self) -> Result<(), CacheError> {
+        let mut entries = self.data.write();
+        entries.clear();
+        Ok(())
+    }
+
+    async fn stats(&self) -> Result<CacheStats, CacheError> {
+        Ok(self.stats.read().clone())
+    }
+    
+    async fn cleanup(&self) -> Result<(), CacheError> {
+        let removed = self.remove_expired().await;
+        if removed > 0 {
+            self.update_stats().await;
+        }
+        Ok(())
+    }
+    
+    async fn optimize(&self) -> Result<(), CacheError> {
+        // In-memory cache doesn't need optimization
+        Ok(())
+    }
+    
+    async fn backup(&self, _path: &str) -> Result<(), CacheError> {
+        // In-memory cache doesn't support backup
+        Err(CacheError::Unavailable("Backup not supported for in-memory cache".into()))
+    }
+    
+    async fn restore(&self, _path: &str) -> Result<(), CacheError> {
+        // In-memory cache doesn't support restore
+        Err(CacheError::Unavailable("Restore not supported for in-memory cache".into()))
+    }
+    
+    async fn health_check(&self) -> Result<(), CacheError> {
+        // Simple health check - just verify we can read/write
+        let key = "health_check".to_string();
+        let value = CacheValue::Response(LLMResponse {
+            text: "test".to_string(),
+            tokens_used: 1,
+            model: "test".to_string(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        });
+        let entry = CacheEntry::new(
+            key.clone(),
+            value,
+            None,
+            None,
+        );
+        
+        self.set(entry).await?;
+        self.delete(&key).await?;
+        
+        Ok(())
+    }
+
+    async fn get_entries_batch(&self, offset: usize, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        let entries = self.data.read();
+        let mut result = Vec::new();
+        
+        for (_, entry) in entries.iter().skip(offset).take(limit) {
+            if !self.is_expired(entry) {
+                result.push(entry.clone());
+            }
+        }
+        
+        Ok(result)
+    }
+
+    fn as_compressible(&self) -> Option<&dyn CompressibleCache> {
+        Some(self)
+    }
+
+    fn as_mut_compressible(&mut self) -> Option<&mut dyn CompressibleCache> {
+        Some(self)
+    }
+
+    fn as_encryptable(&self) -> Option<&dyn EncryptableCache> {
+        Some(self)
+    }
+
+    fn as_mut_encryptable(&mut self) -> Option<&mut dyn EncryptableCache> {
+        Some(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
-/// Calculate cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
+impl CompressibleCache for MemoryCache {
+    fn compression_level(&self) -> u32 {
+        4 // Default compression level
     }
 
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for i in 0..a.len() {
-        dot_product += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+    fn set_compression_level(&mut self, _level: u32) {
+        // Memory cache doesn't actually compress data
     }
 
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        Ok(data.to_vec()) // Memory cache doesn't actually compress
     }
 
-    dot_product / (norm_a.sqrt() * norm_b.sqrt())
+    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, CacheError> {
+        Ok(data.to_vec()) // Memory cache doesn't actually decompress
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use futures::StreamExt;
+#[async_trait]
+impl EncryptableCache for MemoryCache {
+    async fn encrypt(&self, data: Vec<u8>, algorithm: EncryptionAlgorithm) -> Result<Vec<u8>, CacheError> {
+        if !self.is_encryption_ready() {
+            return Err(CacheError::EncryptionNotInitialized);
+        }
 
-    #[tokio::test]
-    async fn test_cache_types() {
-        let mut config = CacheConfig {
-            enabled: true,
-            ttl: Some(Duration::from_secs(60)),
-            ..Default::default()
+        let mut nonce = vec![0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+
+        let key = self.config.encryption_key.as_ref()
+            .ok_or_else(|| CacheError::EncryptionError("No encryption key provided".to_string()))?;
+
+        let encrypted = match algorithm {
+            EncryptionAlgorithm::Aes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| CacheError::EncryptionError(e.to_string()))?;
+                
+                let nonce = AesNonce::from_slice(&nonce);
+                cipher.encrypt(nonce, data.as_ref())
+                    .map_err(|e| CacheError::EncryptionError(e.to_string()))?
+            }
+            EncryptionAlgorithm::ChaCha20Poly1305 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                    .map_err(|e| CacheError::EncryptionError(e.to_string()))?;
+                
+                let nonce = ChaChaPolNonce::from_slice(&nonce);
+                cipher.encrypt(nonce, data.as_ref())
+                    .map_err(|e| CacheError::EncryptionError(e.to_string()))?
+            }
         };
-        let mut cache = InMemoryCache::new(config.clone());
 
-        // Test Query type (default)
-        let response1 = LLMResponse {
-            text: "Query response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response1.clone()).await.unwrap();
-        
-        // Should find with same type
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Query response");
-
-        // Test Extract type
-        config.cache_type = CacheType::Extract;
-        cache.update_config(config.clone()).unwrap();
-        
-        let response2 = LLMResponse {
-            text: "Extract response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response2.clone()).await.unwrap();
-
-        // Should not find Query type response
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Extract response");
-
-        // Test Keywords type
-        config.cache_type = CacheType::Keywords;
-        cache.update_config(config.clone()).unwrap();
-        
-        let response3 = LLMResponse {
-            text: "Keywords response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response3.clone()).await.unwrap();
-
-        // Should find Keywords type response
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Keywords response");
-
-        // Test Custom type
-        config.cache_type = CacheType::Custom("test_type".to_string());
-        cache.update_config(config).unwrap();
-        
-        let response4 = LLMResponse {
-            text: "Custom response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response4.clone()).await.unwrap();
-
-        // Should find Custom type response
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Custom response");
+        let mut result = nonce;
+        result.extend(encrypted);
+        Ok(result)
     }
 
-    #[tokio::test]
-    async fn test_cache_type_streaming() {
-        let mut config = CacheConfig {
-            enabled: true,
-            stream_cache_enabled: true,
-            ttl: Some(Duration::from_secs(60)),
-            ..Default::default()
-        };
-        let mut cache = InMemoryCache::new(config.clone());
+    async fn decrypt(&self, data: Vec<u8>, algorithm: EncryptionAlgorithm) -> Result<Vec<u8>, CacheError> {
+        if !self.is_encryption_ready() {
+            return Err(CacheError::EncryptionNotInitialized);
+        }
 
-        // Create test chunks
-        let chunks = vec![
-            StreamingResponse {
-                text: "Hello ".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: false,
-            },
-            StreamingResponse {
-                text: "world!".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: true,
-            },
-        ];
+        if data.len() < 12 {
+            return Err(CacheError::InvalidData("Data too short for nonce".into()));
+        }
 
-        // Test with Query type (default)
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
-        assert_eq!(received_chunks[0].as_ref().unwrap().text, "Hello ");
+        let (nonce, encrypted) = data.split_at(12);
+        let key = self.config.encryption_key.as_ref()
+            .ok_or_else(|| CacheError::DecryptionError("No encryption key provided".to_string()))?;
 
-        // Test with Extract type
-        config.cache_type = CacheType::Extract;
-        cache.update_config(config.clone()).unwrap();
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
-        assert_eq!(received_chunks[1].as_ref().unwrap().text, "world!");
-
-        // Test with Custom type
-        config.cache_type = CacheType::Custom("streaming_test".to_string());
-        cache.update_config(config).unwrap();
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
+        match algorithm {
+            EncryptionAlgorithm::Aes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| CacheError::DecryptionError(e.to_string()))?;
+                
+                let nonce = AesNonce::from_slice(nonce);
+                cipher.decrypt(nonce, encrypted)
+                    .map_err(|e| CacheError::DecryptionError(e.to_string()))
+            }
+            EncryptionAlgorithm::ChaCha20Poly1305 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                    .map_err(|e| CacheError::DecryptionError(e.to_string()))?;
+                
+                let nonce = ChaChaPolNonce::from_slice(nonce);
+                cipher.decrypt(nonce, encrypted)
+                    .map_err(|e| CacheError::DecryptionError(e.to_string()))
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn test_streaming_cache() {
-        let config = CacheConfig {
-            enabled: true,
-            stream_cache_enabled: true,
-            ttl: Some(Duration::from_secs(60)),
-            ..Default::default()
-        };
-        let cache = InMemoryCache::new(config);
-
-        // Create test chunks
-        let chunks = vec![
-            StreamingResponse {
-                text: "Hello ".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: false,
-            },
-            StreamingResponse {
-                text: "world!".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: true,
-            },
-        ];
-
-        // Test putting streaming response
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-
-        // Test getting streaming response
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
-        assert_eq!(received_chunks[0].as_ref().unwrap().text, "Hello ");
-        assert_eq!(received_chunks[1].as_ref().unwrap().text, "world!");
+    fn is_encryption_ready(&self) -> bool {
+        self.config.use_encryption && self.config.encryption_key.is_some()
     }
 
-    #[tokio::test]
-    async fn test_streaming_cache_expiration() {
-        let config = CacheConfig {
-            enabled: true,
-            stream_cache_enabled: true,
-            ttl: Some(Duration::from_millis(100)), // Very short TTL for normal entries
-            stream_ttl: Some(Duration::from_millis(100)), // Very short TTL for streaming entries
-            ..Default::default()
-        };
-        let cache = InMemoryCache::new(config);
-
-        // Create test chunk
-        let chunks = vec![StreamingResponse {
-            text: "test".to_string(),
-            chunk_tokens: 1,
-            total_tokens: 1,
-            metadata: HashMap::new(),
-            timing: None,
-            done: true,
-        }];
-
-        // Put streaming response
-        cache.put_stream("test_prompt", chunks).await.unwrap();
-
-        // Wait for expiration
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Should return None for expired entry
-        assert!(cache.get_stream("test_prompt").await.is_none());
+    fn supports_encryption(&self) -> bool {
+        true
     }
 
-    #[tokio::test]
-    async fn test_streaming_cache_disabled() {
-        let config = CacheConfig {
-            enabled: true,
-            stream_cache_enabled: false, // Explicitly disable streaming cache
-            ..Default::default()
-        };
-        let cache = InMemoryCache::new(config);
-
-        let chunks = vec![StreamingResponse {
-            text: "test".to_string(),
-            chunk_tokens: 1,
-            total_tokens: 1,
-            metadata: HashMap::new(),
-            timing: None,
-            done: true,
-        }];
-
-        // Put should succeed but not actually store
-        cache.put_stream("test_prompt", chunks).await.unwrap();
-
-        // Should return None when streaming is disabled
-        assert!(cache.get_stream("test_prompt").await.is_none());
+    fn supported_algorithms(&self) -> Vec<EncryptionAlgorithm> {
+        vec![
+            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::ChaCha20Poly1305
+        ]
     }
 } 

@@ -1,4 +1,5 @@
-use crate::types::{Result, Config};
+use crate::types::error::Result;
+use crate::types::{Config};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::info;

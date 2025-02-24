@@ -1,618 +1,396 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, Duration};
-use redis::{Client, AsyncCommands, RedisError};
-use r2d2;
-use serde_json;
-use async_trait::async_trait;
-use std::sync::atomic::Ordering;
-use futures::{Stream, stream};
-use std::pin::Pin;
-use crate::types::llm::{StreamingResponse, LLMClient, LLMError, LLMResponse};
-use super::cache::{
-    config::{CacheBackend, CacheConfig},
-    entry::CacheEntry,
-    metrics::CacheMetrics,
-    ResponseCache,
+use std::time::Duration;
+use tokio::sync::Mutex;
+use redis::{Client, AsyncCommands};
+use serde::{Serialize, Deserialize};
+use crate::llm::cache::{
+    backend::{CacheBackend, CacheError, CacheCapabilities},
+    types::{CacheEntry, CacheStats, StorageConfig, CacheType, CachePriority, CacheValue},
 };
-use super::types::CacheType;
+use async_trait::async_trait;
 
-impl From<RedisError> for LLMError {
-    fn from(err: RedisError) -> Self {
-        LLMError::CacheError(err.to_string())
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisCacheConfig {
+    pub url: String,
+    pub pool_size: usize,
+    pub ttl: Option<Duration>,
+    pub use_compression: bool,
 }
 
-impl From<serde_json::Error> for LLMError {
-    fn from(err: serde_json::Error) -> Self {
-        LLMError::CacheError(format!("Serialization error: {}", err))
-    }
-}
-
-/// Redis-based implementation of ResponseCache
 pub struct RedisCache {
-    /// Cache configuration
-    config: CacheConfig,
-    
-    /// Redis client
-    client: Client,
-    
-    /// Redis connection pool
-    pool: Arc<r2d2::Pool<Client>>,
-
-    /// Cache metrics
-    metrics: Arc<CacheMetrics>,
-
-    /// LLM client for verification
-    llm_client: Option<Arc<dyn LLMClient>>,
+    client: redis::Client,
+    prefix: String,
+    stats: Arc<Mutex<CacheStats>>,
 }
 
 impl RedisCache {
-    /// Create a new Redis cache
-    pub async fn new(config: CacheConfig) -> Result<Self, LLMError> {
-        if let CacheBackend::Redis(redis_config) = &config.backend {
-            let client = Client::open(redis_config.url.as_str())
-                .map_err(|e| LLMError::CacheError(format!("Failed to create Redis client: {}", e)))?;
-
-            let pool_config = r2d2::Pool::builder()
-                .max_size(redis_config.pool_size as u32);
-
-            let pool = pool_config.build(client.clone())
-                .map_err(|e| LLMError::CacheError(format!("Failed to create connection pool: {}", e)))?;
-
-            Ok(Self {
-                config,
-                client,
-                pool: Arc::new(pool),
-                metrics: Arc::new(CacheMetrics::default()),
-                llm_client: None,
-            })
-        } else {
-            Err(LLMError::CacheError("Invalid cache backend configuration".to_string()))
+    pub fn new(client: redis::Client, prefix: String) -> Self {
+        RedisCache { 
+            client,
+            prefix,
+            stats: Arc::new(Mutex::new(CacheStats::default())),
         }
     }
 
-    /// Set the LLM client for verification
-    pub fn set_llm_client(&mut self, client: Arc<dyn LLMClient>) {
-        self.llm_client = Some(client);
-    }
-
-    /// Get a connection from the pool
-    async fn get_conn(&self) -> Result<r2d2::PooledConnection<Client>, LLMError> {
-        self.pool.get()
-            .map_err(|e| LLMError::CacheError(format!("Failed to get Redis connection: {}", e)))
-    }
-
-    /// Build cache key
-    fn build_key(&self, prompt: &str) -> String {
-        format!("{}:{}:{}",
-            self.config.prefix,
-            self.config.cache_type.as_str(),
-            prompt
-        )
-    }
-
-    /// Calculate cosine similarity between two vectors
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-        let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        
-        if norm_a == 0.0 || norm_b == 0.0 {
-            0.0
-        } else {
-            dot_product / (norm_a * norm_b)
-        }
-    }
-
-    /// Get embedding for a prompt
-    async fn get_embedding(&self, prompt: &str) -> Option<Vec<f32>> {
-        let mut conn = self.get_conn().await.ok()?;
-        let key = format!("{}:embedding", self.build_key(prompt));
-        
-        let embedding_data: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query(&mut *conn)
-            .ok()?;
-
-        if let Some(data) = embedding_data {
-            serde_json::from_str(&data).ok()
-        } else {
-            None
-        }
-    }
-
-    /// Store embedding for a prompt
-    async fn store_embedding(&self, prompt: &str, embedding: &[f32]) -> Result<(), LLMError> {
-        let mut conn = self.get_conn().await?;
-        let key = format!("{}:embedding", self.build_key(prompt));
-        
-        let embedding_json = serde_json::to_string(embedding)
-            .map_err(|e| LLMError::CacheError(format!("Failed to serialize embedding: {}", e)))?;
-
-        let _: () = redis::cmd("SET")
-            .arg(&key)
-            .arg(embedding_json)
-            .query(&mut *conn)
-            .map_err(|e| LLMError::CacheError(format!("Failed to store embedding: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Put an entry with embedding for similarity search
-    pub async fn put_with_embedding(&self, prompt: &str, response: LLMResponse, embedding: Vec<f32>) -> Result<(), LLMError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let mut conn = self.client.get_async_connection().await?;
-        let key = format!("{}:{}", self.config.prefix, prompt);
-        let entry = CacheEntry {
-            response,
-            created_at: SystemTime::now(),
-            expires_at: self.config.ttl.map(|ttl| SystemTime::now() + ttl),
-            embedding: Some(embedding),
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-            llm_verified: false,
-            cache_type: self.config.cache_type.clone(),
-            checksum: None,
-            compressed_data: None,
-            original_size: None,
-            metadata: HashMap::new(),
-            chunks: None,
-            total_duration: None,
-            total_tokens: None,
-            is_streaming: false,
-        };
-        let data = serde_json::to_string(&entry)?;
-
-        if let Some(ttl) = self.config.ttl {
-            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
-        } else {
-            conn.set(&key, data).await?;
-        }
-
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Find similar entry using vector similarity
-    pub async fn find_similar_entry(&self, prompt_embedding: &[f32]) -> Option<LLMResponse> {
-        let mut conn = self.get_conn().await.ok()?;
-        let mut best_match = None;
-        let mut best_similarity = self.config.similarity_threshold;
-
-        // Get all cache keys
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("llm:cache:*")
-            .query(&mut *conn)
-            .ok()?;
-
-        for key in keys {
-            // Skip embedding keys
-            if key.ends_with(":embedding") {
-                continue;
-            }
-
-            // Get the embedding for this key
-            let prompt = key.trim_start_matches("llm:cache:");
-            if let Some(embedding) = self.get_embedding(prompt).await {
-                let similarity = Self::cosine_similarity(prompt_embedding, &embedding);
-                if similarity > best_similarity {
-                    // Get the cache entry
-                    let entry_data: Option<String> = redis::cmd("GET")
-                        .arg(&key)
-                        .query(&mut *conn)
-                        .ok()?;
-
-                    if let Some(data) = entry_data {
-                        if let Ok(entry) = serde_json::from_str::<CacheEntry>(&data) {
-                            if !entry.is_expired() {
-                                best_similarity = similarity;
-                                best_match = Some(entry.response);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if best_match.is_some() {
-            self.metrics.similarity_matches.fetch_add(1, Ordering::Relaxed);
-        }
-
-        best_match
-    }
-
-    /// Get cache metrics
-    pub fn get_metrics(&self) -> &CacheMetrics {
-        &self.metrics
-    }
-
-    fn create_entry(&self, response: LLMResponse, ttl: Option<Duration>) -> CacheEntry {
-        CacheEntry {
-            response,
-            created_at: SystemTime::now(),
-            expires_at: ttl.map(|ttl| SystemTime::now() + ttl),
-            embedding: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-            llm_verified: false,
-            cache_type: self.config.cache_type.clone(),
-            checksum: None,
-            compressed_data: None,
-            original_size: None,
-            metadata: HashMap::new(),
-            chunks: None,
-            total_duration: None,
-            total_tokens: None,
-            is_streaming: false,
-        }
-    }
-
-    fn create_streaming_entry(&self, chunks: Vec<StreamingResponse>, ttl: Option<Duration>) -> CacheEntry {
-        let total_text: String = chunks.iter().map(|c| c.text.clone()).collect();
-        let total_tokens = chunks.iter().map(|c| c.chunk_tokens).sum();
-        let total_duration = chunks.last()
-            .and_then(|c| c.timing.as_ref())
-            .map(|t| t.total_duration);
-
-        let response = LLMResponse {
-            text: total_text,
-            tokens_used: total_tokens,
-            model: chunks.last()
-                .map(|c| c.metadata.get("model").cloned().unwrap_or_default())
-                .unwrap_or_default(),
-            cached: true,
-            context: None,
-            metadata: chunks.last()
-                .map(|c| c.metadata.clone())
-                .unwrap_or_default(),
-        };
-
-        CacheEntry {
-            response,
-            created_at: SystemTime::now(),
-            expires_at: ttl.map(|ttl| SystemTime::now() + ttl),
-            embedding: None,
-            access_count: 0,
-            last_accessed: SystemTime::now(),
-            llm_verified: false,
-            cache_type: self.config.cache_type.clone(),
-            checksum: None,
-            compressed_data: None,
-            original_size: None,
-            metadata: HashMap::new(),
-            chunks: Some(chunks),
-            total_duration,
-            total_tokens: Some(total_tokens),
-            is_streaming: true,
-        }
-    }
-
-    fn is_expired(&self, entry: &CacheEntry) -> bool {
-        if let Some(expires_at) = entry.expires_at {
-            SystemTime::now() > expires_at
-        } else {
-            false
-        }
+    fn build_key(&self, key: &str) -> String {
+        format!("{}:{}", self.prefix, key)
     }
 }
 
 #[async_trait]
-impl ResponseCache for RedisCache {
-    async fn get(&self, prompt: &str) -> Option<LLMResponse> {
-        if !self.config.enabled {
-            return None;
-        }
+#[cfg(feature = "redis")]
+impl CacheBackend for RedisCache {
+    fn backend_type(&self) -> CacheType {
+        CacheType::Redis
+    }
 
-        let mut conn = self.get_conn().await.ok()?;
-        let key = self.build_key(prompt);
-
-        // Try exact match first
-        let entry_data: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query(&mut *conn)
-            .ok()?;
-
-        if let Some(data) = entry_data {
-            if let Ok(mut entry) = serde_json::from_str::<CacheEntry>(&data) {
-                if entry.is_expired() {
-                    self.metrics.misses.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-
-                entry.record_access();
-                self.metrics.hits.fetch_add(1, Ordering::Relaxed);
-
-                // Update access metrics in Redis
-                if let Ok(entry_json) = serde_json::to_string(&entry) {
-                    let _: Result<(), _> = redis::cmd("SET")
-                        .arg(&key)
-                        .arg(entry_json)
-                        .query(&mut *conn);
-                }
-
-                Some(entry.response)
-            } else {
-                None
-            }
-        } else if self.config.use_fuzzy_match {
-            // Try similarity matching
-            if let Some(embedding) = self.get_embedding(prompt).await {
-                self.find_similar_entry(&embedding).await
-            } else {
-                None
-            }
-        } else {
-            self.metrics.misses.fetch_add(1, Ordering::Relaxed);
-            None
+    fn capabilities(&self) -> CacheCapabilities {
+        CacheCapabilities {
+            persistent: true,
+            streaming: true,
+            compression: true,
+            encryption: true,
+            transactions: true,
+            pubsub: true,
         }
     }
 
-    async fn put(&self, prompt: &str, response: LLMResponse) -> Result<(), LLMError> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        let mut conn = self.client.get_async_connection().await?;
-        let key = self.build_key(prompt);
-        let entry = CacheEntry::new(response, self.config.ttl, Some(self.config.cache_type.clone()));
-        let data = serde_json::to_string(&entry)?;
-
-        if let Some(ttl) = self.config.ttl {
-            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
-        } else {
-            conn.set(&key, data).await?;
-        }
-
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    async fn initialize(&mut self, _config: StorageConfig) -> Result<(), CacheError> {
+        // Redis client is already initialized in new()
         Ok(())
     }
 
-    async fn cleanup(&self) -> Result<(), LLMError> {
-        let mut conn = self.get_conn().await?;
-        
-        // Get all keys
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("llm:cache:*")
-            .query(&mut *conn)
-            .map_err(|e| LLMError::CacheError(format!("Failed to get keys: {}", e)))?;
+    async fn get(&self, key: &str) -> Result<CacheEntry, CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
-        let mut removed = 0;
+        let key = self.build_key(key);
+        let data: Option<Vec<u8>> = conn.get(&key).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        match data {
+            Some(data) => {
+                let mut entry: CacheEntry = bincode::deserialize(&data)
+                    .map_err(|e| CacheError::StorageError(e.to_string()))?;
+                
+                if entry.metadata.is_expired() {
+                    conn.del(&key).await
+                        .map_err(|e| CacheError::StorageError(e.to_string()))?;
+                    return Err(CacheError::Expired);
+                }
+
+                entry.metadata.access_count += 1;
+                entry.metadata.last_accessed = std::time::SystemTime::now();
+
+                let mut stats = self.stats.lock().await;
+                stats.hits += 1;
+
+                Ok(entry)
+            }
+            None => {
+                let mut stats = self.stats.lock().await;
+                stats.misses += 1;
+                Err(CacheError::NotFound)
+            }
+        }
+    }
+
+    async fn set(&self, entry: CacheEntry) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let key = self.build_key(&entry.key);
+        let data = bincode::serialize(&entry)
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        conn.set(&key, data).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let key = self.build_key(key);
+        conn.del(&key).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let key = self.build_key(key);
+        let exists: bool = conn.exists(&key).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        Ok(exists)
+    }
+
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<CacheEntry>>, CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let redis_keys: Vec<String> = keys.iter()
+            .map(|k| self.build_key(k))
+            .collect();
+
+        let data: Vec<Option<Vec<u8>>> = conn.get(&redis_keys[..]).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(keys.len());
+        let mut stats = self.stats.lock().await;
+
+        for data in data {
+            match data {
+                Some(bytes) => {
+                    match bincode::deserialize(&bytes) {
+                        Ok(mut entry) => {
+                            if entry.metadata.is_expired() {
+                                stats.misses += 1;
+                                results.push(None);
+                            } else {
+                                entry.metadata.access_count += 1;
+                                entry.metadata.last_accessed = std::time::SystemTime::now();
+                                stats.hits += 1;
+                                results.push(Some(entry));
+                            }
+                        }
+                        Err(_) => {
+                            stats.misses += 1;
+                            results.push(None);
+                        }
+                    }
+                }
+                None => {
+                    stats.misses += 1;
+                    results.push(None);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn set_many(&self, entries: Vec<CacheEntry>) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let mut pipeline = redis::pipe();
+        for entry in entries {
+            let key = self.build_key(&entry.key);
+            let data = bincode::serialize(&entry)
+                .map_err(|e| CacheError::StorageError(e.to_string()))?;
+            pipeline.set(&key, data);
+        }
+
+        pipeline.query_async(&mut conn).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn delete_many(&self, keys: &[String]) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let redis_keys: Vec<String> = keys.iter()
+            .map(|k| self.build_key(k))
+            .collect();
+
+        conn.del(&redis_keys[..]).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn clear(&self) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let pattern = format!("{}:*", self.prefix);
+        let keys: Vec<String> = conn.keys(&pattern).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        if !keys.is_empty() {
+            conn.del(&keys[..]).await
+                .map_err(|e| CacheError::StorageError(e.to_string()))?;
+        }
+
+        let mut stats = self.stats.lock().await;
+        *stats = CacheStats::default();
+
+        Ok(())
+    }
+
+    async fn stats(&self) -> Result<CacheStats, CacheError> {
+        let stats = self.stats.lock().await;
+        Ok(stats.clone())
+    }
+
+    async fn cleanup(&self) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let pattern = format!("{}:*", self.prefix);
+        let keys: Vec<String> = conn.keys(&pattern).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
         for key in keys {
-            let entry_data: Option<String> = redis::cmd("GET")
-                .arg(&key)
-                .query(&mut *conn)
-                .map_err(|e| LLMError::CacheError(format!("Failed to get entry: {}", e)))?;
+            let data: Option<Vec<u8>> = conn.get(&key).await
+                .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
-            if let Some(data) = entry_data {
-                if let Ok(entry) = serde_json::from_str::<CacheEntry>(&data) {
-                    if entry.is_expired() {
-                        let _: () = redis::cmd("DEL")
-                            .arg(&key)
-                            .query(&mut *conn)
-                            .map_err(|e| LLMError::CacheError(format!("Failed to delete key: {}", e)))?;
-                        removed += 1;
+            if let Some(data) = data {
+                if let Ok(entry) = bincode::deserialize::<CacheEntry>(&data) {
+                    if entry.metadata.is_expired() {
+                        conn.del(&key).await
+                            .map_err(|e| CacheError::StorageError(e.to_string()))?;
                     }
                 }
             }
         }
 
-        if removed > 0 {
-            self.metrics.evictions.fetch_add(removed, Ordering::Relaxed);
-            self.metrics.size.fetch_sub(removed, Ordering::Relaxed);
-        }
+        Ok(())
+    }
+
+    async fn optimize(&self) -> Result<(), CacheError> {
+        // Redis handles optimization internally
+        Ok(())
+    }
+
+    async fn backup(&self, path: &str) -> Result<(), CacheError> {
+        // Redis handles backups through its own mechanisms
+        Err(CacheError::UnsupportedOperation("Redis backup should be handled through Redis's native backup mechanisms".into()))
+    }
+
+    async fn restore(&self, path: &str) -> Result<(), CacheError> {
+        // Redis handles restores through its own mechanisms
+        Err(CacheError::UnsupportedOperation("Redis restore should be handled through Redis's native restore mechanisms".into()))
+    }
+
+    async fn health_check(&self) -> Result<(), CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
+
+        let _: String = conn.ping().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
         Ok(())
     }
 
-    async fn clear(&self) -> Result<(), LLMError> {
-        let mut conn = self.get_conn().await?;
-        
-        let _: () = redis::cmd("DEL")
-            .arg("llm:cache:*")
-            .query(&mut *conn)
-            .map_err(|e| LLMError::CacheError(format!("Failed to clear cache: {}", e)))?;
+    async fn get_entries_batch(&self, offset: usize, limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        let mut conn = self.client.get_async_connection().await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
-        self.metrics.size.store(0, Ordering::Relaxed);
-        Ok(())
-    }
+        let pattern = format!("{}:*", self.prefix);
+        let keys: Vec<String> = conn.keys(&pattern).await
+            .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
-    fn get_config(&self) -> &CacheConfig {
-        &self.config
-    }
+        let start = offset.min(keys.len());
+        let end = (offset + limit).min(keys.len());
+        let batch_keys = &keys[start..end];
 
-    fn update_config(&mut self, config: CacheConfig) -> Result<(), LLMError> {
-        self.config = config;
-        Ok(())
-    }
-
-    async fn get_stream(&self, prompt: &str) -> Option<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>> {
-        if !self.config.enabled || !self.config.stream_cache_enabled {
-            return None;
-        }
-
-        let mut conn = self.client.get_async_connection().await.ok()?;
-        let key = self.build_key(prompt);
-        let data: Option<String> = conn.get(&key).await.ok()?;
+        let mut entries = Vec::new();
+        for key in batch_keys {
+            let data: Option<Vec<u8>> = conn.get(key).await
+                .map_err(|e| CacheError::StorageError(e.to_string()))?;
 
         if let Some(data) = data {
-            if let Ok(entry) = serde_json::from_str::<CacheEntry>(&data) {
-                if !self.is_expired(&entry) && entry.is_streaming() {
-                    if let Some(chunks) = entry.get_chunks() {
-                        self.metrics.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let chunks = chunks.to_vec();
-                        return Some(Box::pin(stream::iter(chunks.into_iter().map(Ok))));
+                if let Ok(entry) = bincode::deserialize::<CacheEntry>(&data) {
+                    if !entry.metadata.is_expired() {
+                        entries.push(entry);
                     }
                 }
             }
         }
 
-        self.metrics.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        None
-    }
-
-    async fn put_stream(&self, prompt: &str, chunks: Vec<StreamingResponse>) -> Result<(), LLMError> {
-        if !self.config.enabled || !self.config.stream_cache_enabled {
-            return Ok(());
-        }
-
-        let mut conn = self.client.get_async_connection().await?;
-        let key = self.build_key(prompt);
-        let entry = CacheEntry::new_streaming(chunks, self.config.stream_ttl, Some(self.config.cache_type.clone()));
-        let data = serde_json::to_string(&entry)?;
-
-        if let Some(ttl) = self.config.stream_ttl {
-            conn.set_ex(&key, data, ttl.as_secs() as usize).await?;
-        } else {
-            conn.set(&key, data).await?;
-        }
-
-        self.metrics.size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Ok(entries)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use futures::StreamExt;
-    use redis::RedisError;
-    use crate::llm::cache::config::{CacheBackend, RedisConfig};
+#[async_trait]
+#[cfg(not(feature = "redis"))]
+impl CacheBackend for RedisCache {
+    fn backend_type(&self) -> CacheType {
+        CacheType::Memory // Fallback to memory when redis is not enabled
+    }
 
-    fn create_test_config() -> CacheConfig {
-        CacheConfig {
-            enabled: true,
-            ttl: Some(Duration::from_secs(60)),
-            backend: CacheBackend::Redis(RedisConfig {
-                url: "redis://localhost".to_string(),
-                pool_size: 5,
-            }),
-            ..Default::default()
+    fn capabilities(&self) -> CacheCapabilities {
+        CacheCapabilities {
+            persistent: true,
+            streaming: true,
+            compression: true,
+            encryption: true,
+            transactions: true,
+            pubsub: true,
         }
     }
 
-    #[tokio::test]
-    async fn test_redis_cache_types() {
-        let mut config = create_test_config();
-        let mut cache = match RedisCache::new(config.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Skipping test_redis_cache_types: {}", e);
-                return;
-            }
-        };
-
-        // Test Query type (default)
-        let response1 = LLMResponse {
-            text: "Query response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response1.clone()).await.unwrap();
-        
-        // Should find with same type
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Query response");
-
-        // Test Extract type
-        config.cache_type = CacheType::Extract;
-        cache.update_config(config.clone()).unwrap();
-        
-        let response2 = LLMResponse {
-            text: "Extract response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response2.clone()).await.unwrap();
-
-        // Should find Extract type response
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Extract response");
-
-        // Test Custom type
-        config.cache_type = CacheType::Custom("test_type".to_string());
-        cache.update_config(config).unwrap();
-        
-        let response3 = LLMResponse {
-            text: "Custom response".to_string(),
-            tokens_used: 2,
-            model: "test".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        };
-        cache.put("test_prompt", response3.clone()).await.unwrap();
-
-        // Should find Custom type response
-        let result = cache.get("test_prompt").await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().text, "Custom response");
-
-        // Cleanup
-        cache.clear().await.unwrap();
+    async fn initialize(&mut self, _config: StorageConfig) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
     }
 
-    #[tokio::test]
-    async fn test_redis_cache_type_streaming() {
-        let mut config = create_test_config();
-        config.stream_cache_enabled = true;
-        let mut cache = match RedisCache::new(config.clone()).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Skipping test_redis_cache_type_streaming: {}", e);
-                return;
-            }
-        };
+    async fn get(&self, _key: &str) -> Result<CacheEntry, CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
 
-        // Create test chunks
-        let chunks = vec![
-            StreamingResponse {
-                text: "Hello ".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: false,
-            },
-            StreamingResponse {
-                text: "world!".to_string(),
-                chunk_tokens: 1,
-                total_tokens: 2,
-                metadata: HashMap::new(),
-                timing: None,
-                done: true,
-            },
-        ];
+    async fn set(&self, _entry: CacheEntry) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
 
-        // Test with Query type (default)
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
-        assert_eq!(received_chunks[0].as_ref().unwrap().text, "Hello ");
+    async fn delete(&self, _key: &str) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
 
-        // Test with Extract type
-        config.cache_type = CacheType::Extract;
-        cache.update_config(config.clone()).unwrap();
-        cache.put_stream("test_prompt", chunks.clone()).await.unwrap();
-        let stream = cache.get_stream("test_prompt").await.unwrap();
-        let received_chunks: Vec<_> = stream.collect().await;
-        assert_eq!(received_chunks.len(), 2);
-        assert_eq!(received_chunks[1].as_ref().unwrap().text, "world!");
+    async fn exists(&self, _key: &str) -> Result<bool, CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
 
-        // Cleanup
-        cache.clear().await.unwrap();
+    async fn get_many(&self, _keys: &[String]) -> Result<Vec<Option<CacheEntry>>, CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn set_many(&self, _entries: Vec<CacheEntry>) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn delete_many(&self, _keys: &[String]) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn clear(&self) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn stats(&self) -> Result<CacheStats, CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn cleanup(&self) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn optimize(&self) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn backup(&self, _path: &str) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn restore(&self, _path: &str) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn health_check(&self) -> Result<(), CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
+    }
+
+    async fn get_entries_batch(&self, _offset: usize, _limit: usize) -> Result<Vec<CacheEntry>, CacheError> {
+        Err(CacheError::UnsupportedOperation("Redis feature not enabled".to_string()))
     }
 } 

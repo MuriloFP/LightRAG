@@ -5,7 +5,7 @@
 /// - Store and retrieve document metadata
 /// - Query document status counts
 /// - Filter documents by status
-use crate::types::Result;
+use crate::types::error::Result;
 use crate::types::Config;
 use crate::storage::kv::JsonKVStorage;
 use serde_json::Value;

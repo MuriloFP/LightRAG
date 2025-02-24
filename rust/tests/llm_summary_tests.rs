@@ -1,35 +1,33 @@
 use std::sync::Arc;
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use futures::Stream;
+use std::pin::Pin;
+use std::sync::LazyLock;
+
 use super_lightrag::{
-    llm::{LLMClient, LLMConfig, LLMError, LLMParams, LLMResponse},
+    llm::{LLMError, LLMParams, LLMResponse, StreamingResponse, Provider, ProviderConfig},
     processing::summary::{
-        ContentSummarizer, LLMSummarizer, LLMSummaryConfig,
+        ContentSummarizer, LLMSummarizer, LLMSummaryConfig, SummaryError,
     },
+    llm::cache::memory::MemoryCache,
 };
-use super_lightrag::llm::rate_limiter::RateLimitConfig;
 
-static EMPTY_METADATA: Lazy<HashMap<String, String>> = Lazy::new(HashMap::new);
-
-/// Mock LLM client for testing
-struct MockLLMClient {
-    config: LLMConfig,
+/// Mock provider for testing
+struct MockProvider {
+    config: ProviderConfig,
 }
 
-impl MockLLMClient {
+impl MockProvider {
     fn new() -> Self {
         Self {
-            config: LLMConfig {
+            config: ProviderConfig {
                 model: "test-model".to_string(),
                 api_endpoint: None,
                 api_key: None,
                 org_id: None,
                 timeout_secs: 30,
                 max_retries: 3,
-                use_cache: false,
-                rate_limit_config: Some(RateLimitConfig::default()),
-                similarity_threshold: 0.8,
                 extra_config: HashMap::new(),
             },
         }
@@ -37,40 +35,47 @@ impl MockLLMClient {
 }
 
 #[async_trait]
-impl LLMClient for MockLLMClient {
+impl Provider for MockProvider {
     async fn initialize(&mut self) -> Result<(), LLMError> {
         Ok(())
     }
 
-    async fn generate(&self, _prompt: &str, _params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        // Simple mock that returns a fixed summary
+    async fn complete(&self, _prompt: &str, _params: &LLMParams) -> Result<LLMResponse, LLMError> {
         Ok(LLMResponse {
             text: "This is a mock summary of the content.".to_string(),
             tokens_used: 8,
             model: "mock-model".to_string(),
             cached: false,
             context: None,
-            metadata: EMPTY_METADATA.clone(),
+            metadata: HashMap::new(),
         })
     }
 
-    async fn batch_generate(
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _params: &LLMParams,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        unimplemented!("Streaming not implemented for mock provider")
+    }
+
+    async fn complete_batch(
         &self,
         prompts: &[String],
         params: &LLMParams,
     ) -> Result<Vec<LLMResponse>, LLMError> {
         let mut responses = Vec::new();
         for _ in prompts {
-            responses.push(self.generate("", params).await?);
+            responses.push(self.complete("", params).await?);
         }
         Ok(responses)
     }
 
-    fn get_config(&self) -> &LLMConfig {
+    fn get_config(&self) -> &ProviderConfig {
         &self.config
     }
 
-    fn update_config(&mut self, config: LLMConfig) -> Result<(), LLMError> {
+    fn update_config(&mut self, config: ProviderConfig) -> Result<(), LLMError> {
         self.config = config;
         Ok(())
     }
@@ -79,8 +84,9 @@ impl LLMClient for MockLLMClient {
 #[tokio::test]
 async fn test_llm_summarizer() {
     let config = LLMSummaryConfig::default();
-    let llm_client = Arc::new(MockLLMClient::new());
-    let summarizer = LLMSummarizer::new(config, llm_client);
+    let provider = Box::new(MockProvider::new());
+    let cache = Box::new(MemoryCache::new());
+    let summarizer = LLMSummarizer::new(provider, config, cache);
 
     let content = "This is a test content that needs to be summarized. \
                    It contains multiple sentences and should be processed by the LLM.";
@@ -97,66 +103,99 @@ async fn test_llm_summarizer() {
 #[tokio::test]
 async fn test_empty_content() {
     let config = LLMSummaryConfig::default();
-    let llm_client = Arc::new(MockLLMClient::new());
-    let summarizer = LLMSummarizer::new(config, llm_client);
+    let provider = Box::new(MockProvider::new());
+    let cache = Box::new(MemoryCache::new());
+    let summarizer = LLMSummarizer::new(provider, config, cache);
 
     let result = summarizer.generate_summary("").await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(SummaryError::EmptyContent)));
 }
 
 #[tokio::test]
 async fn test_fallback_behavior() {
-    // Create a failing mock client
-    struct FailingMockClient;
-
-    static EMPTY_CONFIG: Lazy<LLMConfig> = Lazy::new(|| LLMConfig {
-        model: "".to_string(),
-        api_endpoint: None,
-        api_key: None,
-        org_id: None,
-        timeout_secs: 30,
-        max_retries: 3,
-        use_cache: false,
-        rate_limit_config: Some(RateLimitConfig::default()),
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    });
+    struct FailingProvider;
 
     #[async_trait]
-    impl LLMClient for FailingMockClient {
+    impl Provider for FailingProvider {
         async fn initialize(&mut self) -> Result<(), LLMError> {
             Ok(())
         }
 
-        async fn generate(&self, _: &str, _: &LLMParams) -> Result<LLMResponse, LLMError> {
+        async fn complete(&self, _: &str, _: &LLMParams) -> Result<LLMResponse, LLMError> {
             Err(LLMError::RequestFailed("Mock failure".to_string()))
         }
 
-        async fn batch_generate(
+        async fn complete_stream(
+            &self,
+            _: &str,
+            _: &LLMParams,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+            unimplemented!()
+        }
+
+        async fn complete_batch(
             &self,
             _: &[String],
             _: &LLMParams,
         ) -> Result<Vec<LLMResponse>, LLMError> {
-            Err(LLMError::RequestFailed("Mock failure".to_string()))
+            unimplemented!()
         }
 
-        fn get_config(&self) -> &LLMConfig {
-            &EMPTY_CONFIG
+        fn get_config(&self) -> &ProviderConfig {
+            static DUMMY_CONFIG: LazyLock<ProviderConfig> = LazyLock::new(|| ProviderConfig {
+                model: "dummy-model".to_string(),
+                api_endpoint: None,
+                api_key: None,
+                org_id: None,
+                timeout_secs: 30,
+                max_retries: 3,
+                extra_config: std::collections::HashMap::new(),
+            });
+            &*DUMMY_CONFIG
         }
 
-        fn update_config(&mut self, _: LLMConfig) -> Result<(), LLMError> {
+        fn update_config(&mut self, _: ProviderConfig) -> Result<(), LLMError> {
             Ok(())
         }
     }
 
     let mut config = LLMSummaryConfig::default();
     config.use_fallback = true;
-    let llm_client = Arc::new(FailingMockClient);
-    let summarizer = LLMSummarizer::new(config, llm_client);
 
-    let content = "Test content for fallback behavior";
+    let provider = Box::new(FailingProvider);
+    let cache = Box::new(MemoryCache::new());
+    let summarizer = LLMSummarizer::new(provider, config, cache);
+
+    let content = "Test content";
     let summary = summarizer.generate_summary(content).await.unwrap();
 
-    // Should get a basic summary instead
-    assert!(summary.text.contains("Test content"));
+    // Should get basic summary from fallback
+    assert!(summary.text.contains(content));
+}
+
+#[tokio::test]
+async fn test_summarize_with_mock() -> Result<(), SummaryError> {
+    let config = LLMSummaryConfig::default();
+    let provider = Box::new(MockProvider::new());
+    let cache = Box::new(MemoryCache::new());
+    let summarizer = LLMSummarizer::new(provider, config, cache);
+
+    let content = "This is a test content that needs to be summarized.";
+    let summary = summarizer.generate_summary(content).await?;
+
+    assert_eq!(summary.text, "This is a mock summary of the content.");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_summarization() {
+    let config = LLMSummaryConfig::default();
+    let provider = Box::new(MockProvider::new());
+    let cache = Box::new(MemoryCache::new());
+    let summarizer = LLMSummarizer::new(provider, config, cache);
+
+    let content = "This is a test content that needs to be summarized.";
+    let summary = summarizer.generate_summary(content).await.unwrap();
+
+    assert_eq!(summary.text, "This is a mock summary of the content.");
 } 

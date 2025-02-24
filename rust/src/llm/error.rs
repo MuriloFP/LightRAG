@@ -1,6 +1,7 @@
 use std::fmt;
 use redis::RedisError;
 use serde_json::Error as JsonError;
+use crate::llm::rate_limiter::RateLimitError;
 
 #[derive(Debug)]
 pub enum LLMError {
@@ -59,6 +60,15 @@ impl From<reqwest::Error> for LLMError {
             LLMError::RequestFailed(format!("Connection failed: {}", err))
         } else {
             LLMError::RequestFailed(err.to_string())
+        }
+    }
+}
+
+impl From<RateLimitError> for LLMError {
+    fn from(err: RateLimitError) -> Self {
+        match err {
+            RateLimitError::LimitExceeded(msg) => LLMError::RateLimitExceeded(msg),
+            RateLimitError::ConfigError(msg) => LLMError::ConfigError(msg),
         }
     }
 } 

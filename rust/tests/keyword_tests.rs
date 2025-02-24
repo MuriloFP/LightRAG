@@ -1,15 +1,83 @@
-use super_lightrag::processing::{
-    KeywordConfig,
-    KeywordExtractor,
-    BasicKeywordExtractor,
-    LLMKeywordExtractor,
-    ConversationTurn,
-};
-use chrono::Utc;
 use std::sync::Arc;
 use std::collections::HashMap;
+use chrono::Utc;
 use async_trait::async_trait;
-use super_lightrag::types::llm::{LLMClient, LLMConfig, LLMParams, LLMResponse, LLMError};
+use futures::Stream;
+use std::pin::Pin;
+
+use super_lightrag::{
+    types::{
+        llm::{LLMParams, LLMResponse, LLMError, StreamingResponse},
+        Error,
+    },
+    processing::keywords::{
+        KeywordExtractor, KeywordConfig, ExtractedKeywords,
+        ConversationTurn, BasicKeywordExtractor, LLMKeywordExtractor
+    },
+    llm::{Provider, ProviderConfig},
+};
+
+/// Mock LLM provider for testing
+struct MockProvider {
+    responses: Vec<String>,
+    current: std::sync::atomic::AtomicUsize,
+}
+
+impl MockProvider {
+    fn new(responses: Vec<String>) -> Self {
+        Self {
+            responses,
+            current: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for MockProvider {
+    async fn initialize(&mut self) -> std::result::Result<(), LLMError> {
+        Ok(())
+    }
+
+    async fn complete(&self, _prompt: &str, _params: &LLMParams) -> std::result::Result<LLMResponse, LLMError> {
+        let idx = self.current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if idx < self.responses.len() {
+            Ok(LLMResponse {
+                text: self.responses[idx].clone(),
+                tokens_used: 100,
+                model: "mock".to_string(),
+                cached: false,
+                context: None,
+                metadata: HashMap::new(),
+            })
+        } else {
+            Err(LLMError::RequestFailed("No more mock responses".to_string()))
+        }
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _params: &LLMParams,
+    ) -> std::result::Result<Pin<Box<dyn Stream<Item = std::result::Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        Err(LLMError::RequestFailed("Streaming not needed for tests".to_string()))
+    }
+
+    async fn complete_batch(
+        &self,
+        _prompts: &[String],
+        _params: &LLMParams,
+    ) -> std::result::Result<Vec<LLMResponse>, LLMError> {
+        Err(LLMError::RequestFailed("Batch completion not needed for tests".to_string()))
+    }
+
+    fn get_config(&self) -> &ProviderConfig {
+        panic!("Config not needed for tests")
+    }
+
+    fn update_config(&mut self, _config: ProviderConfig) -> std::result::Result<(), LLMError> {
+        Err(LLMError::RequestFailed("Config update not needed for tests".to_string()))
+    }
+}
 
 #[tokio::test]
 async fn test_basic_keyword_config() {
@@ -82,63 +150,13 @@ async fn test_conversation_history() {
     assert_eq!(result.metadata.get("extraction_method").unwrap(), "tf-idf");
 }
 
-/// Mock LLM client for testing
-struct MockLLMClient {
-    config: LLMConfig,
-}
-
-impl MockLLMClient {
-    fn new() -> Self {
-        Self {
-            config: LLMConfig::default(),
-        }
-    }
-}
-
-#[async_trait]
-impl LLMClient for MockLLMClient {
-    async fn initialize(&mut self) -> Result<(), LLMError> {
-        Ok(())
-    }
-
-    async fn generate(&self, _prompt: &str, _params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        Ok(LLMResponse {
-            text: r#"{
-                "high_level_keywords": ["test", "mock"],
-                "low_level_keywords": ["detail1", "detail2"]
-            }"#.to_string(),
-            tokens_used: 10,
-            model: "openai/gpt-4".to_string(),
-            cached: false,
-            context: None,
-            metadata: HashMap::new(),
-        })
-    }
-
-    async fn batch_generate(
-        &self,
-        prompts: &[String],
-        params: &LLMParams,
-    ) -> Result<Vec<LLMResponse>, LLMError> {
-        let mut responses = Vec::new();
-        for _ in prompts {
-            responses.push(self.generate("", params).await?);
-        }
-        Ok(responses)
-    }
-
-    fn get_config(&self) -> &LLMConfig {
-        &self.config
-    }
-
-    fn update_config(&mut self, config: LLMConfig) -> Result<(), LLMError> {
-        self.config = config;
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn test_llm_keyword_extraction() {
+    let mock_response = r#"{
+        "high_level_keywords": ["artificial intelligence", "technology", "innovation"],
+        "low_level_keywords": ["machine learning", "neural networks", "data science", "algorithms"]
+    }"#.to_string();
+
     let config = KeywordConfig {
         max_high_level: 5,
         max_low_level: 10,
@@ -147,8 +165,9 @@ async fn test_llm_keyword_extraction() {
         extra_params: HashMap::new(),
     };
 
-    let llm_client = Arc::new(MockLLMClient::new());
+    let provider = Arc::new(Box::new(MockProvider::new(vec![mock_response])) as Box<dyn Provider>);
     let llm_params = LLMParams {
+        model: "test-model".to_string(),
         max_tokens: 100,
         temperature: 0.3,
         top_p: 0.9,
@@ -156,20 +175,34 @@ async fn test_llm_keyword_extraction() {
         system_prompt: Some("Extract keywords from the text.".to_string()),
         query_params: None,
         extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
     };
 
-    let extractor = LLMKeywordExtractor::new(config, llm_client, llm_params);
-
-    let content = "This is a test content for keyword extraction.";
-    let keywords = extractor.extract_keywords(content).await.unwrap();
-
-    assert_eq!(keywords.high_level, vec!["test", "mock"]);
-    assert_eq!(keywords.low_level, vec!["detail1", "detail2"]);
+    let extractor = LLMKeywordExtractor::new(config, provider, llm_params);
+    let content = "AI and machine learning are revolutionizing technology through innovative algorithms and neural networks.";
+    
+    let result = extractor.extract_keywords(content).await.unwrap();
+    
+    // Check high-level keywords
+    assert_eq!(result.high_level.len(), 3);
+    assert!(result.high_level.contains(&"artificial intelligence".to_string()));
+    assert!(result.high_level.contains(&"technology".to_string()));
+    assert!(result.high_level.contains(&"innovation".to_string()));
+    
+    // Check low-level keywords
+    assert_eq!(result.low_level.len(), 4);
+    assert!(result.low_level.contains(&"machine learning".to_string()));
+    assert!(result.low_level.contains(&"neural networks".to_string()));
+    assert!(result.low_level.contains(&"data science".to_string()));
+    assert!(result.low_level.contains(&"algorithms".to_string()));
+    
+    // Check metadata
+    assert!(result.metadata.contains_key("extraction_method"));
+    assert_eq!(result.metadata.get("extraction_method").unwrap(), "llm");
+    assert!(result.metadata.contains_key("timestamp"));
 }
 
 #[tokio::test]
-async fn test_keyword_extraction_with_history() {
+async fn test_llm_empty_content() {
     let config = KeywordConfig {
         max_high_level: 5,
         max_low_level: 10,
@@ -178,36 +211,84 @@ async fn test_keyword_extraction_with_history() {
         extra_params: HashMap::new(),
     };
 
-    let llm_client = Arc::new(MockLLMClient::new());
-    let llm_params = LLMParams {
-        max_tokens: 100,
-        temperature: 0.3,
-        top_p: 0.9,
-        stream: false,
-        system_prompt: Some("Extract keywords considering conversation history.".to_string()),
-        query_params: None,
+    let provider = Arc::new(Box::new(MockProvider::new(vec![])) as Box<dyn Provider>);
+    let llm_params = LLMParams::default();
+    let extractor = LLMKeywordExtractor::new(config, provider, llm_params);
+
+    let result = extractor.extract_keywords("").await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_llm_with_conversation_history() {
+    let mock_response = r#"{
+        "high_level_keywords": ["artificial intelligence", "machine learning", "conversation"],
+        "low_level_keywords": ["context", "history", "dialogue", "interaction"]
+    }"#.to_string();
+
+    let config = KeywordConfig {
+        max_high_level: 5,
+        max_low_level: 10,
+        language: Some("English".to_string()),
+        use_llm: true,
         extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
     };
 
-    let extractor = LLMKeywordExtractor::new(config, llm_client, llm_params);
+    let provider = Arc::new(Box::new(MockProvider::new(vec![mock_response])) as Box<dyn Provider>);
+    let llm_params = LLMParams::default();
+    let extractor = LLMKeywordExtractor::new(config, provider, llm_params);
 
-    let content = "This is the current message.";
+    let content = "Tell me more about that.";
     let history = vec![
         ConversationTurn {
             role: "user".to_string(),
-            content: "Previous message 1".to_string(),
-            timestamp: None,
+            content: "How does AI work?".to_string(),
+            timestamp: Some(Utc::now()),
         },
         ConversationTurn {
             role: "assistant".to_string(),
-            content: "Previous message 2".to_string(),
-            timestamp: None,
+            content: "AI systems use machine learning algorithms...".to_string(),
+            timestamp: Some(Utc::now()),
         },
     ];
 
-    let keywords = extractor.extract_keywords_with_history(content, &history).await.unwrap();
+    let result = extractor.extract_keywords_with_history(content, &history).await.unwrap();
 
-    assert_eq!(keywords.high_level, vec!["test", "mock"]);
-    assert_eq!(keywords.low_level, vec!["detail1", "detail2"]);
+    // Check high-level keywords
+    assert_eq!(result.high_level.len(), 3);
+    assert!(result.high_level.contains(&"artificial intelligence".to_string()));
+    assert!(result.high_level.contains(&"machine learning".to_string()));
+    assert!(result.high_level.contains(&"conversation".to_string()));
+
+    // Check low-level keywords
+    assert_eq!(result.low_level.len(), 4);
+    assert!(result.low_level.contains(&"context".to_string()));
+    assert!(result.low_level.contains(&"history".to_string()));
+    assert!(result.low_level.contains(&"dialogue".to_string()));
+    assert!(result.low_level.contains(&"interaction".to_string()));
+
+    // Check metadata
+    assert!(result.metadata.contains_key("extraction_method"));
+    assert_eq!(result.metadata.get("extraction_method").unwrap(), "llm");
+    assert!(result.metadata.contains_key("timestamp"));
+}
+
+#[tokio::test]
+async fn test_llm_invalid_response() {
+    let mock_response = "Invalid JSON response".to_string();
+
+    let config = KeywordConfig {
+        max_high_level: 5,
+        max_low_level: 10,
+        language: Some("English".to_string()),
+        use_llm: true,
+        extra_params: HashMap::new(),
+    };
+
+    let provider = Arc::new(Box::new(MockProvider::new(vec![mock_response])) as Box<dyn Provider>);
+    let llm_params = LLMParams::default();
+    let extractor = LLMKeywordExtractor::new(config, provider, llm_params);
+
+    let result = extractor.extract_keywords("Test content").await;
+    assert!(result.is_err());
 } 

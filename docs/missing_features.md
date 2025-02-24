@@ -17,167 +17,195 @@ rust/
 ├── Cargo.toml            # Project manifest
 └── README.md             # Project documentation
 
-## OpenAI Client
-- [x] Basic chat completion
-- [x] Streaming support
-- [x] Error handling
-  - [x] Rate limit errors
-  - [x] Token limit validation
-  - [x] Model validation
-  - [x] API errors
-- [x] System prompts
-- [x] Conversation history
-- [x] Context building
-- [x] Caching with similarity search
-  - [x] Embeddings generation
-  - [x] Similarity search
-  - [x] Cache integration
-  - [x] Tests
-- [ ] Performance optimizations
-  - [ ] Batch processing optimization
-  - [ ] Connection pooling
-  - [ ] Response streaming optimization
-- [ ] Integration tests
-  - [x] Basic completion tests
-  - [x] Streaming tests
-  - [x] Error handling tests
-  - [x] Token validation tests
-  - [x] Cache tests
-  - [ ] Performance tests
 
-## Anthropic Client
-- [x] Basic completion
-- [x] Streaming support
-- [x] Error handling
-  - [x] Rate limit errors
-  - [x] Token limit validation
-  - [x] Model validation
-  - [x] API errors
-- [x] System prompts
-- [x] Conversation history
-- [x] Context building
-- [ ] Caching with similarity search
-  - [ ] Embeddings generation (not supported by Anthropic yet)
-  - [ ] Similarity search
-  - [ ] Cache integration
-  - [ ] Tests
-- [ ] Performance optimizations
-  - [ ] Batch processing optimization
-  - [ ] Connection pooling
-  - [ ] Response streaming optimization
-- [ ] Integration tests
-  - [x] Basic completion tests
-  - [x] Streaming tests
-  - [x] Error handling tests
-  - [x] Token validation tests
-  - [x] Cache tests
-  - [ ] Performance tests
+## Architecture Improvements
+- [ ] Function-Based Architecture (LightRAG Style)
+  - [x] LLM Function Implementation
+    - [x] Convert OpenAI client to simple functions
+      - [x] Complete function
+      - [x] Stream function
+      - [x] Batch function
+    - [x] Convert Anthropic client to simple functions
+      - [x] Complete function
+      - [x] Stream function
+      - [x] Batch function
+    - [x] Convert Ollama client to simple functions
+      - [x] Complete function
+      - [x] Stream function
+      - [x] Batch function
+  - [ ] Embedding Function Implementation
+    - [x] OpenAI embeddings function
+    - [ ] Anthropic embeddings function (placeholder for future)
+    - [x] Ollama embeddings function
+  - [x] Simplified Configuration
+    - [x] Single config struct for all providers
+    - [x] Environment-based configuration
+    - [x] Per-call configuration overrides
+  - [ ] Caching Layer
+    - [x] Simple function-based cache interface
+    - [ ] Multi-Environment Cache Implementation
+      - [ ] Browser Environment (Web Apps)
+        - [x] IndexedDB primary storage
+        - [x] LocalStorage fallback
+        - [x] Memory cache layer
+        - [x] Cache size management
+        - [x] Automatic cleanup
+      - [ ] Native Environment (Desktop/Mobile)
+        - [x] SQLite primary storage
+        - [x] Memory cache layer
+        - [x] Configurable memory limits
+        - [x] Disk space management
+        - [x] Background cleanup
+      - [ ] Server Environment
+        - [x] Redis implementation
+        - [x] Memory cache layer
+        - [x] Distributed cache support
+  - [ ] Unified Cache Interface
+    - [x] Environment detection
+    - [x] Automatic backend selection
+    - [x] Common API across all platforms
+    - [x] Error handling
+    - [ ] Migration support
+  - [ ] Cache Performance Optimizations
+    - [x] Compression support
+      - [x] LZ4 compression
+      - [x] Configurable compression levels
+      - [x] Automatic compression
+    - [x] Encryption support
+      - [x] AES-256-GCM encryption
+      - [x] ChaCha20-Poly1305 encryption
+      - [x] Key management
+      - [x] Password-based key derivation
+    - [x] Two-tier caching
+      - [x] Fast memory layer
+      - [x] Persistent storage layer
+      - [x] Automatic synchronization
+    - [x] Cache warming
+      - [x] Pre-fetching
+      - [x] Background loading
+      - [x] Priority-based loading
+  - [ ] Cache Management
+    - [x] Size monitoring
+    - [x] Automatic pruning
+    - [x] Cache statistics
+    - [x] Health checks
+    - [ ] Recovery mechanisms
+  - [ ] Testing Infrastructure
+    - [ ] Function mocking helpers
+    - [ ] Test fixtures
+    - [ ] Integration test suite
+  - [ ] Documentation
+    - [ ] Function documentation
+    - [ ] Usage examples
+    - [ ] Migration guide from client-based to function-based
+  - [ ] Examples
+    - [ ] Basic usage examples
+    - [ ] Provider switching example
+    - [ ] Custom provider implementation
+    - [ ] Caching configuration
+    - [ ] Error handling
 
-## Ollama Client
-- [x] Basic completion
-- [x] Streaming support
-- [x] Error handling
-  - [x] Rate limit errors
-  - [x] Token limit validation
-  - [x] Model validation
-  - [x] API errors
-- [x] System prompts
-- [x] Conversation history
-- [x] Context building
-- [x] Caching with similarity search
-  - [x] Embeddings generation
-  - [x] Similarity search
-  - [x] Cache integration
-  - [x] Tests
-- [ ] Performance optimizations
-  - [ ] Batch processing optimization
-  - [ ] Connection pooling
-  - [ ] Response streaming optimization
-- [ ] Integration tests
-  - [x] Basic completion tests
-  - [x] Streaming tests
-  - [x] Error handling tests
-  - [x] Token validation tests
-  - [x] Cache tests
-  - [x] Similarity search tests
-  - [ ] Performance tests
+## Cache System Architecture
+- [ ] Core Cache Features
+  - [x] Tiered Storage System
+    - [x] Fast in-memory cache layer
+    - [x] Persistent storage layer
+    - [x] Automatic synchronization
+    - [x] Cache coherence
+  - [ ] Environment-Specific Storage
+    - [ ] Browser (Web Apps)
+      - [x] IndexedDB Storage
+        - [x] Database schema
+        - [x] Version management
+        - [x] Migration support
+      - [x] LocalStorage Support
+        - [x] Key-value storage
+        - [x] Size limits
+        - [x] Quota management
+      - [x] Memory Constraints
+        - [x] Quota monitoring
+        - [x] Automatic pruning
+        - [x] Priority-based eviction
+      - [x] Offline Support
+        - [x] Service worker integration
+        - [x] Sync on reconnect
+        - [x] Conflict resolution
+    - [ ] Native (Desktop/Mobile)
+      - [x] SQLite primary storage
+      - [x] Database schema
+      - [x] Version management
+      - [x] Migration support
+      - [x] Backup/restore
+      - [x] Integrity checks
+      - [x] Compression support
+      - [x] Encryption support
+        - [x] Basic infrastructure
+        - [x] AES-256-GCM support
+        - [x] ChaCha20-Poly1305 support
+        - [x] Implementation complete
+      - [x] Vacuum/optimize
+        - [x] Basic VACUUM command
+        - [x] Auto-vacuum support
+        - [x] Incremental vacuum
+        - [x] Progress monitoring
+    - [ ] Server
+      - [x] Redis implementation
+      - [x] Memory cache layer
+      - [x] Distributed cache support
+  - [ ] Cache Configuration
+    - [x] Environment-aware defaults
+    - [x] Memory limits
+    - [x] Storage quotas
+    - [x] TTL settings
+    - [x] Cleanup policies
 
-## LiteLLM Client
-- [x] Basic completion
-- [x] Streaming support
-- [x] Error handling
-  - [x] Rate limit errors
-  - [x] Token limit validation
-  - [x] Model validation
-  - [x] API errors
-- [x] System prompts
-- [x] Conversation history
-- [x] Context building
-- [ ] Caching with similarity search
-  - [ ] Embeddings generation
-  - [ ] Similarity search
-  - [ ] Cache integration
-  - [ ] Tests
-- [ ] Performance optimizations
-  - [ ] Batch processing optimization
-  - [ ] Connection pooling
-  - [ ] Response streaming optimization
-- [ ] Integration tests
-  - [x] Basic completion tests
-  - [x] Streaming tests
-  - [x] Error handling tests
-  - [x] Token validation tests
-  - [x] Cache tests
-  - [ ] Performance tests
-
-## Common Features
-- [x] Prompt templates
-- [x] Template validation
-- [x] Template caching
-- [x] System prompts
-- [x] Model validation
-- [x] Error handling
-- [x] Rate limiting
-- [x] Token validation
-- [x] Conversation history
-- [x] Context building
-- [x] Caching with similarity search
-  - [x] In-memory cache
-  - [x] Redis support
-  - [x] Distributed cache support
-  - [x] Cache metrics
-  - [x] Cache compression
-  - [x] Cache encryption
-  - [x] Cache integrity validation
-  - [x] Cache synchronization
-- [ ] Performance optimizations
-  - [x] Connection pooling (implemented in LiteLLM and Redis cache)
-  - [x] Request batching (implemented in all clients)
-  - [x] Response streaming optimization (implemented with batching and compression support)
-  - [ ] Memory usage optimization
-  - [ ] Concurrent request handling optimization
-  - [ ] Cache eviction strategy optimization
-- [ ] Resource cleanup
-  - [x] Automatic cache cleanup (implemented in InMemoryCache and RedisCache)
-  - [x] Connection cleanup (implemented in rate limiter)
-  - [ ] Memory cleanup (needs improvement)
-  - [ ] Resource leak prevention
-  - [ ] Graceful shutdown handling
-- [ ] Comprehensive documentation
-  - [ ] API documentation
-  - [ ] Usage examples
-  - [ ] Integration guides
-  - [ ] Performance tuning guide
-  - [ ] Resource management guide
-- [ ] End-to-end tests
-  - [ ] Load testing
-  - [ ] Stress testing
-  - [ ] Performance benchmarks
-- [ ] Benchmarks
-  - [ ] Response time benchmarks
-  - [ ] Memory usage benchmarks
-  - [ ] Cache efficiency benchmarks
-  - [ ] Streaming performance benchmarks
+- [ ] Cache Features by Environment
+  - [ ] Browser Environment
+    - [x] IndexedDB Storage
+      - [x] Database schema
+      - [x] Version management
+      - [x] Migration support
+    - [x] LocalStorage Support
+      - [x] Key-value storage
+      - [x] Size limits
+      - [x] Quota management
+    - [x] Memory Constraints
+      - [x] Quota monitoring
+      - [x] Automatic pruning
+      - [x] Priority-based eviction
+    - [x] Offline Support
+      - [x] Service worker integration
+      - [x] Sync on reconnect
+      - [x] Conflict resolution
+  
+  - [ ] Native Environment
+    - [x] SQLite primary storage
+    - [x] Database schema
+    - [x] Version management
+    - [x] Migration support
+    - [x] Backup/restore
+    - [x] Integrity checks
+    - [x] Compression support
+    - [x] Encryption support
+      - [x] Basic infrastructure
+      - [x] AES-256-GCM support
+      - [x] ChaCha20-Poly1305 support
+      - [x] Implementation complete
+    - [x] Vacuum/optimize
+      - [x] Basic VACUUM command
+      - [x] Auto-vacuum support
+      - [x] Incremental vacuum
+      - [x] Progress monitoring
+  
+  - [ ] Server Environment
+    - [x] Redis implementation
+    - [x] Distributed cache support
+    - [x] Replication
+    - [x] Failover
+    - [x] Compression support
+    - [x] Encryption support
+    - [x] Cluster mode
+    - [x] Pub/sub support
 
 ## Testing & Validation
 - [x] Unit tests for each provider
@@ -236,4 +264,171 @@ rust/
   - [ ] Code coverage
   - [ ] Performance regression tests
   - [ ] Resource usage monitoring
-  - [ ] Security scanning 
+  - [ ] Security scanning
+
+## Testing Plan
+
+### Priority 1: Core Cache System Tests
+- [x] Memory Cache Tests
+  - [x] Basic CRUD operations
+  - [x] TTL functionality
+  - [x] Memory limits
+  - [x] Concurrent access
+- [x] SQLite Cache Tests
+  - [x] Basic CRUD operations
+  - [x] TTL functionality
+  - [x] Vacuum operations
+  - [x] Encryption operations
+  - [x] Concurrent access
+- [x] Redis Cache Tests
+  - [x] Basic CRUD operations
+  - [x] TTL functionality
+  - [x] Cluster mode operations
+  - [x] Pub/Sub operations
+  - [x] Encryption operations
+  - [x] Concurrent access
+- [x] Tiered Cache Tests
+  - [x] Cache hierarchy operations
+  - [x] Fallback behavior
+  - [x] Cache synchronization
+  - [x] Performance optimization
+
+### Priority 2: LLM Integration Tests
+- [x] OpenAI Provider Tests
+  - [x] Chat completion
+  - [x] Streaming responses
+  - [x] Error handling
+  - [x] Rate limiting
+  - [x] Configuration management
+  - [x] Batch operations
+- [x] Anthropic Provider Tests
+  - [x] Chat completion
+  - [x] Streaming responses
+  - [x] Error handling
+  - [x] Rate limiting
+  - [x] Configuration management
+  - [x] Batch operations
+- [x] Ollama Provider Tests
+  - [x] Local model operations
+  - [x] Streaming responses
+  - [x] Error handling
+  - [x] Configuration management
+  - [x] Batch operations
+  - [x] Metadata validation
+- [x] Multi-Model Tests
+  - [x] Provider initialization
+  - [x] Round-robin completion
+  - [x] Streaming support
+  - [x] Batch operations
+  - [x] Error handling
+  - [x] Configuration management
+
+### Priority 3: Performance Tests
+- [ ] Cache Operation Benchmarks
+  - [ ] Read/write latency
+  - [ ] Throughput under load
+  - [ ] Memory usage patterns
+- [ ] LLM Operation Benchmarks
+  - [ ] Response time metrics
+  - [ ] Token processing speed
+  - [ ] Streaming performance
+- [ ] System Load Tests
+  - [ ] CPU utilization
+  - [ ] Memory consumption
+  - [ ] Network bandwidth
+
+### Priority 4: Stress Tests
+- [ ] High Concurrency Tests
+  - [ ] Multiple simultaneous requests
+  - [ ] Cache contention handling
+  - [ ] Connection pool behavior
+- [ ] Resource Limit Tests
+  - [ ] Memory pressure handling
+  - [ ] Storage quota enforcement
+  - [ ] Connection limits
+- [ ] Long-Running Tests
+  - [ ] Memory leak detection
+  - [ ] Performance degradation
+  - [ ] Resource cleanup
+
+### Priority 5: Integration Tests
+- [ ] System Integration
+  - [ ] Component interaction
+  - [ ] Error propagation
+  - [ ] Configuration validation
+- [ ] Cross-Provider Operations
+  - [ ] Provider switching
+  - [ ] Error recovery
+  - [ ] Cost optimization
+- [ ] End-to-End Workflows
+  - [ ] Request processing
+  - [ ] Caching behavior
+  - [ ] Response handling
+
+### Priority 6: Security Tests
+- [ ] Access Control
+  - [ ] API key validation
+  - [ ] Rate limiting
+  - [ ] Request validation
+- [ ] Data Protection
+  - [ ] Encryption at rest
+  - [ ] Encryption in transit
+  - [ ] Key management
+- [ ] Vulnerability Testing
+  - [ ] Input validation
+  - [ ] SQL injection prevention
+  - [ ] XSS prevention
+
+### Test Infrastructure
+- [x] Test Directory Structure
+  - [x] Modular organization
+  - [x] Clear categorization
+  - [x] Extensible layout
+- [ ] Test Utilities
+  - [ ] Mock implementations
+  - [ ] Test data generators
+  - [ ] Assertion helpers
+- [ ] Test Documentation
+  - [ ] Setup instructions
+  - [ ] Test descriptions
+  - [ ] Coverage reports
+
+### Continuous Integration
+- [ ] CI Pipeline
+  - [ ] Automated test runs
+  - [ ] Coverage tracking
+  - [ ] Performance monitoring
+- [ ] Quality Gates
+  - [ ] Minimum coverage
+  - [ ] Performance thresholds
+  - [ ] Security checks
+
+## Unified Cache Interface
+- [x] Common API
+- [x] Error handling
+- [x] Statistics tracking
+- [x] Health checks
+- [x] Compression support
+- [ ] Encryption support
+- [ ] Migration tools
+- [ ] Backup tools
+
+## Cache Performance
+- [x] Batch operations
+- [x] Connection pooling
+- [x] Compression support
+- [ ] Query optimization
+- [ ] Index optimization
+- [ ] Cache warming
+- [ ] Cache prefetching
+- [ ] Cache invalidation
+
+## Cache Management
+- [x] Statistics/metrics
+- [x] Health monitoring
+- [x] Automatic cleanup
+- [x] Compression support
+- [ ] Admin interface
+- [ ] Cache analysis
+- [ ] Cache visualization
+- [ ] Cache debugging 

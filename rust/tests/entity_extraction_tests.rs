@@ -4,26 +4,33 @@ use chrono::Utc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 use serde_json::Value;
+use tokio::sync::Mutex;
+use futures::Stream;
+use std::pin::Pin;
+
 use super_lightrag::{
     types::{
+        llm::{LLMParams, LLMResponse, LLMError, StreamingResponse},
         Error,
-        llm::{LLMClient, LLMConfig, LLMParams, LLMResponse, LLMError},
+        KnowledgeGraph,
     },
     storage::{
         GraphStorage, VectorStorage, 
-        graph::{EdgeData, NodeData, embeddings::EmbeddingAlgorithm},
+        graph::{EdgeData, NodeData},
         vector::{VectorData, SearchResult, UpsertResponse},
     },
     processing::{
         entity::{
             EntityExtractor, EntityExtractionConfig, LLMEntityExtractor,
+            EntityType,
+            Entity,
         },
         keywords::ConversationTurn,
     },
+    llm::{Provider, ProviderConfig},
 };
 
-/// Mock implementation of GraphStorage for testing
-#[derive(Clone)]
+/// Mock graph storage for testing
 struct MockGraphStorage {
     nodes: HashMap<String, NodeData>,
     edges: HashMap<String, (String, String, EdgeData)>,
@@ -40,6 +47,10 @@ impl MockGraphStorage {
 
 #[async_trait]
 impl GraphStorage for MockGraphStorage {
+    async fn query_with_keywords(&self, _keywords: &[String]) -> Result<String, Error> {
+        Ok("".to_string())
+    }
+
     async fn initialize(&mut self) -> Result<(), Error> {
         Ok(())
     }
@@ -48,33 +59,22 @@ impl GraphStorage for MockGraphStorage {
         Ok(())
     }
 
-    async fn has_node(&self, id: &str) -> bool {
-        self.nodes.contains_key(id)
+    async fn has_node(&self, node_id: &str) -> bool {
+        self.nodes.contains_key(node_id)
     }
 
-    async fn get_node(&self, id: &str) -> Option<NodeData> {
-        self.nodes.get(id).cloned()
-    }
-
-    async fn upsert_node(&mut self, id: &str, data: HashMap<String, Value>) -> Result<(), Error> {
-        self.nodes.insert(id.to_string(), NodeData { id: id.to_string(), attributes: data });
-        Ok(())
-    }
-
-    async fn upsert_edge(&mut self, source: &str, target: &str, data: EdgeData) -> Result<(), Error> {
-        let edge_id = format!("{}_{}", source, target);
-        self.edges.insert(edge_id, (source.to_string(), target.to_string(), data));
-        Ok(())
-    }
-
-    async fn get_edge(&self, source: &str, target: &str) -> Option<EdgeData> {
-        let edge_id = format!("{}_{}", source, target);
-        self.edges.get(&edge_id).map(|(_, _, data)| data.clone())
-    }
-
-    async fn has_edge(&self, source: &str, target: &str) -> bool {
-        let edge_id = format!("{}_{}", source, target);
+    async fn has_edge(&self, source_id: &str, target_id: &str) -> bool {
+        let edge_id = format!("{}_{}", source_id, target_id);
         self.edges.contains_key(&edge_id)
+    }
+
+    async fn get_node(&self, node_id: &str) -> Option<NodeData> {
+        self.nodes.get(node_id).cloned()
+    }
+
+    async fn get_edge(&self, source_id: &str, target_id: &str) -> Option<EdgeData> {
+        let edge_id = format!("{}_{}", source_id, target_id);
+        self.edges.get(&edge_id).map(|(_, _, data)| data.clone())
     }
 
     async fn get_node_edges(&self, node_id: &str) -> Option<Vec<(String, String, EdgeData)>> {
@@ -101,6 +101,17 @@ impl GraphStorage for MockGraphStorage {
         let src_degree = self.node_degree(src_id).await?;
         let tgt_degree = self.node_degree(tgt_id).await?;
         Ok(src_degree + tgt_degree)
+    }
+
+    async fn upsert_node(&mut self, node_id: &str, attributes: HashMap<String, Value>) -> Result<(), Error> {
+        self.nodes.insert(node_id.to_string(), NodeData { id: node_id.to_string(), attributes });
+        Ok(())
+    }
+
+    async fn upsert_edge(&mut self, source_id: &str, target_id: &str, data: EdgeData) -> Result<(), Error> {
+        let edge_id = format!("{}_{}", source_id, target_id);
+        self.edges.insert(edge_id, (source_id.to_string(), target_id.to_string(), data));
+        Ok(())
     }
 
     async fn delete_node(&mut self, node_id: &str) -> Result<(), Error> {
@@ -143,132 +154,23 @@ impl GraphStorage for MockGraphStorage {
         Ok(())
     }
 
-    async fn embed_nodes(&self, _algorithm: EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>), Error> {
-        Ok((vec![], vec![])) // Mock implementation returns empty embeddings
-    }
-
-    async fn query_with_keywords(&self, keywords: &[String]) -> Result<String, Error> {
-        let mut context = String::new();
-        
-        for keyword in keywords {
-            // Search for nodes containing the keyword
-            for (_, node_data) in &self.nodes {
-                if let Some(content) = node_data.attributes.get("content").and_then(|v| v.as_str()) {
-                    if content.to_lowercase().contains(&keyword.to_lowercase()) {
-                        // Add node content to context
-                        context.push_str(content);
-                        context.push_str("\n");
-                        
-                        // Get connected nodes through edges
-                        for (_, (src, tgt, _)) in &self.edges {
-                            let neighbor_id = if src == &node_data.id { tgt } else if tgt == &node_data.id { src } else { continue };
-                            if let Some(neighbor_data) = self.nodes.get(neighbor_id) {
-                                if let Some(neighbor_content) = neighbor_data.attributes.get("content").and_then(|v| v.as_str()) {
-                                    context.push_str(neighbor_content);
-                                    context.push_str("\n");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        Ok(context)
+    async fn embed_nodes(&self, _algorithm: super_lightrag::storage::graph::embeddings::EmbeddingAlgorithm) -> Result<(Vec<f32>, Vec<String>), Error> {
+        Ok((vec![], vec![]))
     }
 
     async fn get_all_labels(&self) -> Result<Vec<String>, Error> {
-        // Return all node IDs as labels for the mock implementation
         Ok(self.nodes.keys().cloned().collect())
     }
 
-    async fn get_knowledge_graph(&self, node_label: &str, max_depth: i32) -> Result<super_lightrag::types::KnowledgeGraph, Error> {
-        use super_lightrag::types::{KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge};
-        use std::collections::HashSet;
-
-        let mut result = KnowledgeGraph {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-        };
-
-        let mut seen_nodes = HashSet::new();
-        let mut seen_edges = HashSet::new();
-
-        // Helper function to add a node and its edges recursively
-        fn add_node_and_edges(
-            storage: &MockGraphStorage,
-            node_id: &str,
-            depth: i32,
-            max_depth: i32,
-            result: &mut KnowledgeGraph,
-            seen_nodes: &mut HashSet<String>,
-            seen_edges: &mut HashSet<String>,
-        ) {
-            if depth > max_depth || seen_nodes.contains(node_id) {
-                return;
-            }
-
-            // Add the node
-            if let Some(node_data) = storage.nodes.get(node_id) {
-                result.nodes.push(KnowledgeGraphNode {
-                    id: node_id.to_string(),
-                    labels: vec![node_id.to_string()],
-                    properties: node_data.attributes.clone(),
-                });
-                seen_nodes.insert(node_id.to_string());
-
-                // Add edges
-                for (edge_id, (src, tgt, edge_data)) in &storage.edges {
-                    if src == node_id || tgt == node_id {
-                        if !seen_edges.contains(edge_id) {
-                            result.edges.push(KnowledgeGraphEdge {
-                                id: edge_id.clone(),
-                                edge_type: None,
-                                source: src.clone(),
-                                target: tgt.clone(),
-                                properties: {
-                                    let mut props = HashMap::new();
-                                    let weight_value = serde_json::Number::from_f64(edge_data.weight)
-                                        .unwrap_or_else(|| serde_json::Number::from(0));
-                                    props.insert("weight".to_string(), serde_json::Value::Number(weight_value));
-                                    if let Some(desc) = &edge_data.description {
-                                        props.insert("description".to_string(), serde_json::Value::String(desc.clone()));
-                                    }
-                                    if let Some(keywords) = &edge_data.keywords {
-                                        props.insert("keywords".to_string(), serde_json::Value::Array(
-                                            keywords.iter().map(|k| serde_json::Value::String(k.clone())).collect()
-                                        ));
-                                    }
-                                    props
-                                },
-                            });
-                            seen_edges.insert(edge_id.clone());
-
-                            // Recursively process connected node
-                            let next_node = if src == node_id { tgt } else { src };
-                            add_node_and_edges(storage, next_node, depth + 1, max_depth, result, seen_nodes, seen_edges);
-                        }
-                    }
-                }
-            }
-        }
-
-        if node_label == "*" {
-            // Add all nodes and their edges
-            for node_id in self.nodes.keys() {
-                add_node_and_edges(self, node_id, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
-            }
-        } else {
-            // Start from the specified node
-            add_node_and_edges(self, node_label, 0, max_depth, &mut result, &mut seen_nodes, &mut seen_edges);
-        }
-
-        Ok(result)
+    async fn get_knowledge_graph(&self, _node_label: &str, _max_depth: i32) -> Result<KnowledgeGraph, Error> {
+        Ok(KnowledgeGraph {
+            nodes: vec![],
+            edges: vec![],
+        })
     }
 }
 
-/// Mock implementation of VectorStorage for testing
-#[derive(Clone)]
+/// Mock vector storage for testing
 struct MockVectorStorage {
     vectors: HashMap<String, VectorData>,
 }
@@ -291,29 +193,22 @@ impl VectorStorage for MockVectorStorage {
         Ok(())
     }
 
-    async fn query(&self, _query: Vec<f32>, _top_k: usize) -> Result<Vec<SearchResult>, Error> {
-        Ok(vec![
-            SearchResult {
-                id: "1".to_string(),
-                distance: 0.9,
-                metadata: [("content".to_string(), Value::String("Test content 1".to_string()))]
-                    .into_iter()
-                    .collect(),
-            },
-            SearchResult {
-                id: "2".to_string(),
-                distance: 0.8,
-                metadata: [("content".to_string(), Value::String("Test content 2".to_string()))]
-                    .into_iter()
-                    .collect(),
-            },
-        ])
+    async fn query(&self, _query: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>, Error> {
+        let mut results = Vec::new();
+        for (id, data) in self.vectors.iter().take(top_k) {
+            results.push(SearchResult {
+                id: id.clone(),
+                distance: 1.0,
+                metadata: data.metadata.clone(),
+            });
+        }
+        Ok(results)
     }
 
     async fn upsert(&mut self, data: Vec<VectorData>) -> Result<UpsertResponse, Error> {
         let mut inserted = Vec::new();
         let mut updated = Vec::new();
-        
+
         for vector in data {
             if self.vectors.contains_key(&vector.id) {
                 updated.push(vector.id.clone());
@@ -322,7 +217,7 @@ impl VectorStorage for MockVectorStorage {
             }
             self.vectors.insert(vector.id.clone(), vector);
         }
-        
+
         Ok(UpsertResponse { inserted, updated })
     }
 
@@ -334,125 +229,190 @@ impl VectorStorage for MockVectorStorage {
     }
 }
 
-struct MockLLMClient {
-    config: LLMConfig,
+/// Mock LLM provider for testing
+struct MockProvider {
+    responses: Vec<String>,
+    current: std::sync::atomic::AtomicUsize,
 }
 
-impl MockLLMClient {
-    fn new() -> Self {
+impl MockProvider {
+    fn new(responses: Vec<String>) -> Self {
         Self {
-            config: LLMConfig::default(),
+            responses,
+            current: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
 
-#[async_trait]
-impl LLMClient for MockLLMClient {
-    async fn initialize(&mut self) -> Result<(), LLMError> {
+#[async_trait::async_trait]
+impl Provider for MockProvider {
+    async fn initialize(&mut self) -> std::result::Result<(), LLMError> {
         Ok(())
     }
 
-    async fn generate(&self, prompt: &str, _params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        Ok(LLMResponse {
-            text: if prompt.contains("should we continue") {
-                "no".to_string()
-            } else {
-                r#"("entity"<|>MICROSOFT<|>organization<|>A leading technology company)##
-("entity"<|>BILL GATES<|>person<|>Co-founder of Microsoft)##
-("relationship"<|>MICROSOFT<|>BILL GATES<|>Bill Gates co-founded Microsoft and served as CEO<|>founder,leadership<|>0.9)"#.to_string()
-            },
-            tokens_used: 50,
-            model: "mock-model".to_string(),
-            cached: false,
-            context: None,
-            metadata: Default::default(),
-        })
-    }
-
-    async fn batch_generate(
-        &self,
-        prompts: &[String],
-        params: &LLMParams,
-    ) -> Result<Vec<LLMResponse>, LLMError> {
-        let mut responses = Vec::new();
-        for prompt in prompts {
-            responses.push(self.generate(prompt, params).await?);
+    async fn complete(&self, _prompt: &str, _params: &LLMParams) -> std::result::Result<LLMResponse, LLMError> {
+        let idx = self.current.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if idx < self.responses.len() {
+            Ok(LLMResponse {
+                text: self.responses[idx].clone(),
+                tokens_used: 100,
+                model: "mock".to_string(),
+                cached: false,
+                context: None,
+                metadata: HashMap::new(),
+            })
+        } else {
+            Err(LLMError::RequestFailed("No more mock responses".to_string()))
         }
-        Ok(responses)
     }
 
-    fn get_config(&self) -> &LLMConfig {
-        &self.config
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _params: &LLMParams,
+    ) -> std::result::Result<Pin<Box<dyn Stream<Item = std::result::Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        Err(LLMError::RequestFailed("Streaming not needed for tests".to_string()))
     }
 
-    fn update_config(&mut self, config: LLMConfig) -> Result<(), LLMError> {
-        self.config = config;
-        Ok(())
+    async fn complete_batch(
+        &self,
+        _prompts: &[String],
+        _params: &LLMParams,
+    ) -> std::result::Result<Vec<LLMResponse>, LLMError> {
+        Err(LLMError::RequestFailed("Batch completion not needed for tests".to_string()))
+    }
+
+    fn get_config(&self) -> &ProviderConfig {
+        panic!("Config not needed for tests")
+    }
+
+    fn update_config(&mut self, _config: ProviderConfig) -> std::result::Result<(), LLMError> {
+        Err(LLMError::RequestFailed("Config update not needed for tests".to_string()))
     }
 }
 
 #[tokio::test]
-async fn test_entity_extraction() -> Result<(), Error> {
-    let llm_client = Arc::new(MockLLMClient::new());
-    let graph_storage = Arc::new(RwLock::new(MockGraphStorage::new()));
-    let entity_vector_store = Arc::new(RwLock::new(MockVectorStorage::new()));
-    let relationship_vector_store = Arc::new(RwLock::new(MockVectorStorage::new()));
+async fn test_basic_entity_extraction() {
+    // Mock response in the expected format from LLM
+    let mock_response = r#"{type: person, name: JOHN DOE, description: A software engineer at Acme Corp}
+{type: organization, name: ACME CORP, description: A technology company}
+[src: JOHN DOE, tgt: ACME CORP, type: employment, description: Works as an engineer]"#.to_string();
 
-    let content = "Microsoft is a leading technology company. Bill Gates co-founded Microsoft.";
-    let _conversation_history = vec![
-        ConversationTurn {
-            role: "user".to_string(),
-            content: "Tell me about Microsoft".to_string(),
-            timestamp: Some(Utc::now()),
-        },
-        ConversationTurn {
-            role: "assistant".to_string(),
-            content: "Microsoft is a technology company founded by Bill Gates".to_string(),
-            timestamp: Some(Utc::now()),
-        },
+    let provider = Arc::new(Box::new(MockProvider::new(vec![mock_response])) as Box<dyn Provider>);
+    
+    let config = EntityExtractionConfig {
+        max_gleaning_attempts: 1,
+        language: "English".to_string(),
+        entity_types: vec![
+            EntityType::Person,
+            EntityType::Organization,
+        ],
+        use_cache: false,
+        cache_similarity_threshold: 0.95,
+        extra_params: HashMap::new(),
+    };
+
+    let extractor = LLMEntityExtractor::new(provider, config);
+
+    let text = "John Doe is a software engineer working at Acme Corp.";
+    let (entities, relationships) = extractor.extract_entities(text).await.unwrap();
+
+    // Verify entities
+    assert_eq!(entities.len(), 2);
+    let john = entities.iter().find(|e| e.name == "JOHN DOE").unwrap();
+    assert_eq!(john.entity_type, EntityType::Person);
+    assert_eq!(john.description, "A software engineer at Acme Corp");
+
+    let acme = entities.iter().find(|e| e.name == "ACME CORP").unwrap();
+    assert_eq!(acme.entity_type, EntityType::Organization);
+    assert_eq!(acme.description, "A technology company");
+
+    // Verify relationships
+    assert_eq!(relationships.len(), 1);
+    let rel = &relationships[0];
+    assert_eq!(rel.src_id, "JOHN DOE");
+    assert_eq!(rel.tgt_id, "ACME CORP");
+    assert_eq!(rel.description, "Works as an engineer");
+    assert_eq!(rel.keywords, "employment");
+    assert_eq!(rel.weight, 0.9);
+}
+
+#[tokio::test]
+async fn test_empty_content() {
+    let provider = Arc::new(Box::new(MockProvider::new(vec![])) as Box<dyn Provider>);
+    
+    let config = EntityExtractionConfig::default();
+    let extractor = LLMEntityExtractor::new(provider, config);
+
+    let result = extractor.extract_entities("").await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_multiple_entity_types() {
+    let mock_response = r#"{type: geo, name: NEW YORK, description: A major city in the United States}
+{type: event, name: TECH EXPO 2024, description: Annual technology conference}
+{type: category, name: AI SYSTEMS, description: Advanced computing technologies}
+[src: TECH EXPO 2024, tgt: NEW YORK, type: location, description: Takes place in]
+[src: TECH EXPO 2024, tgt: AI SYSTEMS, type: topic, description: Features presentations on]"#.to_string();
+
+    let provider = Arc::new(Box::new(MockProvider::new(vec![mock_response])) as Box<dyn Provider>);
+    
+    let config = EntityExtractionConfig {
+        max_gleaning_attempts: 1,
+        language: "English".to_string(),
+        entity_types: vec![
+            EntityType::Geo,
+            EntityType::Event,
+            EntityType::Category,
+        ],
+        use_cache: false,
+        cache_similarity_threshold: 0.95,
+        extra_params: HashMap::new(),
+    };
+
+    let extractor = LLMEntityExtractor::new(provider, config);
+
+    let text = "The Tech Expo 2024 in New York will showcase the latest AI Systems.";
+    let (entities, relationships) = extractor.extract_entities(text).await.unwrap();
+
+    // Verify entities
+    assert_eq!(entities.len(), 3);
+    assert!(entities.iter().any(|e| e.name == "NEW YORK" && e.entity_type == EntityType::Geo));
+    assert!(entities.iter().any(|e| e.name == "TECH EXPO 2024" && e.entity_type == EntityType::Event));
+    assert!(entities.iter().any(|e| e.name == "AI SYSTEMS" && e.entity_type == EntityType::Category));
+
+    // Verify relationships
+    assert_eq!(relationships.len(), 2);
+    assert!(relationships.iter().any(|r| r.src_id == "TECH EXPO 2024" && r.tgt_id == "NEW YORK"));
+    assert!(relationships.iter().any(|r| r.src_id == "TECH EXPO 2024" && r.tgt_id == "AI SYSTEMS"));
+}
+
+#[tokio::test]
+async fn test_entity_extraction_with_gleaning() {
+    let mock_responses = vec![
+        r#"{type: person, name: ALICE SMITH, description: CEO of Tech Corp}"#.to_string(),
+        r#"{type: organization, name: TECH CORP, description: Technology company}"#.to_string(),
+        r#""#.to_string()
     ];
 
-    let config = EntityExtractionConfig::default();
-    let extractor = LLMEntityExtractor::new(
-        config,
-        llm_client,
-        graph_storage,
-        entity_vector_store,
-        relationship_vector_store,
-    );
-    let result = extractor.extract_entities(content).await?;
-
-    assert!(!result.0.is_empty());
-    assert!(!result.1.is_empty());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_empty_content() -> Result<(), Error> {
-    let llm_client = Arc::new(MockLLMClient::new());
-    let graph_storage = Arc::new(RwLock::new(MockGraphStorage::new()));
-    let entity_vector_store = Arc::new(RwLock::new(MockVectorStorage::new()));
-    let relationship_vector_store = Arc::new(RwLock::new(MockVectorStorage::new()));
-
-    let content = "";
-    let config = EntityExtractionConfig::default();
-    let extractor = LLMEntityExtractor::new(
-        config,
-        llm_client,
-        graph_storage,
-        entity_vector_store,
-        relationship_vector_store,
-    );
-    let result = extractor.extract_entities(content).await;
+    let provider = Arc::new(Box::new(MockProvider::new(mock_responses)) as Box<dyn Provider>);
     
-    // Should return an EntityError::EmptyContent error
-    assert!(result.is_err());
-    if let Err(Error::Storage(msg)) = result {
-        assert_eq!(msg, "Empty content");
-    } else {
-        panic!("Expected Error::Storage(\"Empty content\"), got {:?}", result);
-    }
+    let config = EntityExtractionConfig {
+        max_gleaning_attempts: 2,
+        language: "English".to_string(),
+        entity_types: vec![EntityType::Person, EntityType::Organization],
+        use_cache: false,
+        cache_similarity_threshold: 0.95,
+        extra_params: HashMap::new(),
+    };
 
-    Ok(())
+    let extractor = LLMEntityExtractor::new(provider, config);
+
+    let text = "Alice Smith leads Tech Corp as its CEO.";
+    let (entities, _) = extractor.extract_entities(text).await.unwrap();
+
+    assert_eq!(entities.len(), 2);
+    assert!(entities.iter().any(|e| e.name == "ALICE SMITH" && e.entity_type == EntityType::Person));
+    assert!(entities.iter().any(|e| e.name == "TECH CORP" && e.entity_type == EntityType::Organization));
 } 

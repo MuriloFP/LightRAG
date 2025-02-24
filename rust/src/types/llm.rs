@@ -1,13 +1,8 @@
 use std::collections::HashMap;
 use thiserror::Error;
 use serde::{Deserialize, Serialize};
-use async_trait::async_trait;
-use futures::Stream;
-use std::pin::Pin;
 use crate::processing::keywords::ConversationTurn;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use crate::llm::rate_limiter::{RateLimiter, RateLimit, RateLimitConfig};
+use crate::llm::rate_limiter::RateLimitError;
 
 /// Query mode for RAG operations
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,7 +37,7 @@ pub struct QueryParams {
     /// Whether to only return context without LLM processing
     pub only_need_context: bool,
 
-    /// Whether to only return prompt without LLM processing
+    /// Whether to only need prompt without LLM processing
     pub only_need_prompt: bool,
 
     /// Response type (e.g. "Multiple Paragraphs", "Single Paragraph", "Bullet Points")
@@ -78,6 +73,12 @@ pub struct QueryParams {
     /// Number of conversation history turns to include
     pub history_turns: Option<usize>,
 
+    /// Number of documents to retrieve
+    pub num_docs: usize,
+
+    /// Whether to include metadata
+    pub include_metadata: bool,
+
     /// Additional parameters
     pub extra_params: HashMap<String, String>,
 }
@@ -90,47 +91,21 @@ impl Default for QueryParams {
             only_need_context: false,
             only_need_prompt: false,
             response_type: "Multiple Paragraphs".to_string(),
-            top_k: 5,
+            top_k: 3,
             similarity_threshold: 0.7,
-            max_context_tokens: 3000,
-            max_token_for_text_unit: 4000,
-            max_token_for_global_context: 4000,
-            max_token_for_local_context: 4000,
+            max_context_tokens: 2048,
+            max_token_for_text_unit: 512,
+            max_token_for_global_context: 1024,
+            max_token_for_local_context: 1024,
             hl_keywords: None,
             ll_keywords: None,
             conversation_history: None,
-            history_turns: Some(3),
+            history_turns: None,
+            num_docs: 3,
+            include_metadata: false,
             extra_params: HashMap::new(),
         }
     }
-}
-
-/// Errors that can occur during LLM operations
-#[derive(Error, Debug)]
-pub enum LLMError {
-    /// API request failed
-    #[error("API request failed: {0}")]
-    RequestFailed(String),
-
-    /// Rate limit exceeded
-    #[error("Rate limit exceeded: {0}")]
-    RateLimitExceeded(String),
-
-    /// Invalid response format
-    #[error("Invalid response format: {0}")]
-    InvalidResponse(String),
-
-    /// Token limit exceeded
-    #[error("Token limit exceeded: {0}")]
-    TokenLimitExceeded(String),
-
-    /// Configuration error
-    #[error("Configuration error: {0}")]
-    ConfigError(String),
-
-    /// Cache error
-    #[error("Cache error: {0}")]
-    CacheError(String),
 }
 
 /// Parameters for LLM requests
@@ -172,57 +147,6 @@ impl Default for LLMParams {
             system_prompt: None,
             query_params: None,
             extra_params: HashMap::new(),
-        }
-    }
-}
-
-/// Configuration for LLM client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LLMConfig {
-    /// Model identifier/name
-    pub model: String,
-
-    /// API endpoint (if applicable)
-    pub api_endpoint: Option<String>,
-
-    /// API key (if required)
-    pub api_key: Option<String>,
-
-    /// Organization ID (if applicable)
-    pub org_id: Option<String>,
-
-    /// Timeout in seconds
-    pub timeout_secs: u64,
-
-    /// Maximum retries
-    pub max_retries: u32,
-
-    /// Whether to use caching
-    pub use_cache: bool,
-
-    /// Rate limiting configuration
-    pub rate_limit_config: Option<RateLimitConfig>,
-
-    /// Similarity threshold for cache matching (0.0 to 1.0)
-    pub similarity_threshold: f32,
-
-    /// Additional configuration parameters
-    pub extra_config: HashMap<String, String>,
-}
-
-impl Default for LLMConfig {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            api_endpoint: None,
-            api_key: None,
-            org_id: None,
-            timeout_secs: 30,
-            max_retries: 3,
-            use_cache: false,
-            rate_limit_config: None,
-            similarity_threshold: 0.8,
-            extra_config: HashMap::new(),
         }
     }
 }
@@ -287,68 +211,39 @@ pub struct StreamingTiming {
     pub token_gen_duration: Option<u64>,
 }
 
-/// Trait for LLM clients
-#[async_trait]
-pub trait LLMClient: Send + Sync {
-    /// Initialize the client
-    async fn initialize(&mut self) -> Result<(), LLMError>;
+/// Error types for LLM operations
+#[derive(Debug, Error)]
+pub enum LLMError {
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 
-    /// Generate text from a prompt
-    async fn generate(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError>;
+    #[error("Request failed: {0}")]
+    RequestFailed(String),
 
-    /// Generate text with conversation history
-    async fn generate_with_history(
-        &self,
-        prompt: &str,
-        _history: &[ConversationTurn],
-        params: &LLMParams
-    ) -> Result<LLMResponse, LLMError> {
-        // Default implementation falls back to regular generate
-        self.generate(prompt, params).await
-    }
+    #[error("Invalid response: {0}")]
+    InvalidResponse(String),
 
-    /// Generate text with streaming response
-    async fn generate_stream(
-        &self,
-        prompt: &str,
-        params: &LLMParams
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
-        // Default implementation returns error if streaming not supported
-        Err(LLMError::ConfigError("Streaming not supported by this client".to_string()))
-    }
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
 
-    /// Generate text with context building
-    async fn generate_with_context(
-        &self,
-        prompt: &str,
-        context: &str,
-        params: &LLMParams
-    ) -> Result<LLMResponse, LLMError> {
-        // Default implementation combines context with prompt
-        let full_prompt = format!("Context:\n{}\n\nQuery:\n{}", context, prompt);
-        self.generate(&full_prompt, params).await
-    }
+    #[error("Token limit exceeded: {0}")]
+    TokenLimitExceeded(String),
 
-    /// Generate text for multiple prompts in batch
-    async fn batch_generate(
-        &self,
-        prompts: &[String],
-        params: &LLMParams,
-    ) -> Result<Vec<LLMResponse>, LLMError>;
+    #[error("Cache error: {0}")]
+    CacheError(String),
 
-    /// Get the current configuration
-    fn get_config(&self) -> &LLMConfig;
+    #[error("Streaming error: {0}")]
+    StreamingError(String),
 
-    /// Update the configuration
-    fn update_config(&mut self, config: LLMConfig) -> Result<(), LLMError>;
+    #[error("Other error: {0}")]
+    Other(String),
+}
 
-    /// Check rate limits and acquire permission
-    async fn check_rate_limit(&self, tokens: u32) -> Result<RateLimit, LLMError> {
-        if let Some(rate_limit_config) = &self.get_config().rate_limit_config {
-            let rate_limiter = RateLimiter::new(rate_limit_config.clone());
-            rate_limiter.try_acquire(tokens).await.map_err(|e| LLMError::RateLimitExceeded(e.to_string()))
-        } else {
-            Ok(RateLimit::new(Arc::new(RwLock::new(0))))
+impl From<RateLimitError> for LLMError {
+    fn from(err: RateLimitError) -> Self {
+        match err {
+            RateLimitError::LimitExceeded(msg) => LLMError::RateLimitExceeded(msg),
+            RateLimitError::ConfigError(msg) => LLMError::ConfigError(msg),
         }
     }
 } 

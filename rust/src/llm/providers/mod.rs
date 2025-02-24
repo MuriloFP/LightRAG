@@ -1,49 +1,31 @@
-/// OpenAI API client implementation.
+/// OpenAI API integration.
 /// 
 /// Provides integration with OpenAI's GPT models through their REST API.
 /// Supports:
-/// - Text completion
-/// - Response caching
-/// - Rate limiting and retries
+/// - Text completion via openai_complete()
+/// - Streaming via openai_complete_stream()
+/// - Batch completion via openai_complete_batch()
 pub mod openai;
 
-/// Ollama API client implementation.
+/// Ollama API integration.
 /// 
 /// Provides integration with locally hosted language models through Ollama.
 /// Supports:
-/// - Text generation
-/// - Custom model loading
-/// - Local inference
+/// - Text generation via ollama_complete()
+/// - Streaming via ollama_complete_stream()
+/// - Batch completion via ollama_complete_batch()
 pub mod ollama;
 
-/// Anthropic API client implementation.
+/// Anthropic API integration.
 ///
 /// Provides integration with Anthropic's Claude models through their REST API.
 /// Supports:
-/// - Text completion
-/// - Response streaming
-/// - System prompts
+/// - Text completion via anthropic_complete()
+/// - Streaming via anthropic_complete_stream()
+/// - Batch completion via anthropic_complete_batch()
 pub mod anthropic;
 
-/// LiteLLM proxy client implementation.
-///
-/// Provides unified interface for multiple LLM providers.
-/// Supports:
-/// - Multiple provider routing
-/// - Unified configuration
-/// - Provider fallbacks
-/// - Consistent API interface
-pub mod litellm;
-
-pub use openai::OpenAIClient;
-pub use ollama::OllamaClient;
-pub use anthropic::AnthropicClient;
-pub use litellm::{
-    LiteLLMClient,
-    LiteLLMConfig,
-    LLMProvider,
-    ProviderAdapter,
-    ProviderConfig,
-    OpenAIAdapter,
-    AnthropicAdapter,
-}; 
+// Re-export function-based APIs
+pub use openai::{openai_complete, openai_complete_stream, openai_complete_batch};
+pub use ollama::{ollama_complete, ollama_complete_stream, ollama_complete_batch};
+pub use anthropic::{anthropic_complete, anthropic_complete_stream, anthropic_complete_batch}; 

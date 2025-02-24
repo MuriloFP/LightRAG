@@ -12,12 +12,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use md5;
 use futures::future::BoxFuture;
+use tokio::sync::RwLock;
 
 use crate::llm::{
-    LLMClient, LLMConfig, LLMError, LLMParams, LLMResponse,
-    cache::{ResponseCache, InMemoryCache},
+    LLMError, LLMParams, LLMResponse,
+    StreamingResponse,
+    StreamingTiming,
+    cache::{ResponseCache, MemoryCache},
+    Provider,
+    ProviderConfig,
+    rate_limiter::{RateLimiter},
 };
-use crate::types::llm::{QueryParams, StreamingResponse, StreamingTiming};
+use crate::types::llm::{QueryParams};
 use crate::processing::keywords::ConversationTurn;
 use crate::processing::context::ContextBuilder;
 use crate::llm::streaming::{StreamProcessor, StreamConfig};
@@ -33,19 +39,19 @@ pub struct OllamaResponse {
     pub done: bool,
     
     /// Total duration of the request in microseconds
-    pub total_duration: u64,
+    pub total_duration: Option<u64>,
     
     /// Time taken to load the model in microseconds
-    pub load_duration: u64,
+    pub load_duration: Option<u64>,
     
     /// Number of tokens in the prompt
-    pub prompt_eval_count: usize,
+    pub prompt_eval_count: Option<usize>,
     
     /// Number of tokens in the response
-    pub eval_count: usize,
+    pub eval_count: Option<usize>,
     
     /// Time taken for token generation in microseconds
-    pub eval_duration: u64,
+    pub eval_duration: Option<u64>,
 
     /// Error message if any
     pub error: Option<String>,
@@ -79,445 +85,285 @@ pub struct OllamaStreamResponse {
     pub error: Option<String>,
 }
 
-/// Ollama client implementation
-pub struct OllamaClient {
-    /// HTTP client
-    client: Client,
-    
-    /// Client configuration
-    config: LLMConfig,
-    
-    /// Response cache
-    cache: Option<InMemoryCache>,
+/// Configuration for Ollama API calls
+#[derive(Debug, Clone)]
+pub struct OllamaConfig {
+    pub api_base: String,
+    pub model: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub timeout_secs: u64,
 }
 
-impl OllamaClient {
-    /// Create a new Ollama client
-    pub fn new(config: LLMConfig) -> Result<Self, LLMError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()
-            .map_err(|e| LLMError::ConfigError(e.to_string()))?;
-            
-        let cache = if config.use_cache {
-            Some(InMemoryCache::default())
-        } else {
-            None
-        };
-        
-        Ok(Self {
-            client,
-            config,
-            cache,
-        })
-    }
-    
-    /// Build the API request URL
-    fn build_url(&self) -> Result<String, LLMError> {
-        let endpoint = self.config.api_endpoint.as_ref()
-            .ok_or_else(|| LLMError::ConfigError("API endpoint not configured".to_string()))?;
-            
-        Ok(format!("{}/api/generate", endpoint))
-    }
-
-    /// Validate token limits
-    fn validate_token_limits(&self, prompt: &str, params: &LLMParams) -> Result<(), LLMError> {
-        let estimated_prompt_tokens = prompt.split_whitespace().count();
-        if estimated_prompt_tokens + params.max_tokens > 4096 { // Ollama's typical token limit
-            return Err(LLMError::TokenLimitExceeded(format!(
-                "Total tokens ({} prompt + {} max_tokens) exceeds model limit",
-                estimated_prompt_tokens,
-                params.max_tokens
-            )));
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            api_base: "http://localhost:11434".to_string(),
+            model: "llama2".to_string(),
+            max_tokens: 1024,
+            temperature: 0.7,
+            top_p: 1.0,
+            timeout_secs: 30,
         }
-        Ok(())
-    }
-
-    /// Map Ollama errors to LLMError
-    fn map_ollama_error(&self, error: &str) -> LLMError {
-        if error.contains("rate limit") || error.contains("too many requests") {
-            LLMError::RateLimitExceeded(error.to_string())
-        } else if error.contains("context length") || error.contains("token limit") {
-            LLMError::TokenLimitExceeded(error.to_string())
-        } else if error.contains("model") && (error.contains("not found") || error.contains("failed to load")) {
-            LLMError::ConfigError(format!("Model error: {}", error))
-        } else if error.contains("invalid") {
-            LLMError::InvalidResponse(error.to_string())
-        } else {
-            LLMError::RequestFailed(error.to_string())
-        }
-    }
-
-    /// Handle response errors
-    fn handle_response_error(&self, response: &OllamaResponse) -> Result<(), LLMError> {
-        if let Some(error) = &response.error {
-            Err(self.map_ollama_error(error))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Handle streaming response errors
-    fn handle_stream_error(&self, response: &OllamaStreamResponse) -> Result<(), LLMError> {
-        if let Some(error) = &response.error {
-            Err(self.map_ollama_error(error))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Generate embeddings for text using Ollama's embedding endpoint
-    async fn get_embedding(&self, text: &str) -> Result<Option<Vec<f32>>, LLMError> {
-        let url = format!("{}/api/embeddings", self.config.api_endpoint
-            .as_ref()
-            .ok_or_else(|| LLMError::ConfigError("API endpoint not configured".to_string()))?);
-
-        let response = self.client.post(&url)
-            .json(&json!({
-                "model": self.config.model,
-                "prompt": text,
-            }))
-            .send()
-            .await
-            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let error = response.text().await.unwrap_or_default();
-            return Err(self.map_ollama_error(&error));
-        }
-
-        #[derive(Deserialize)]
-        struct EmbeddingResponse {
-            embedding: Vec<f32>,
-        }
-
-        let embedding_response: EmbeddingResponse = response.json()
-            .await
-            .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
-
-        Ok(Some(embedding_response.embedding))
-    }
-
-    /// Check cache with similarity search
-    async fn check_cache(&self, prompt: &str, _params: &QueryParams) -> Option<LLMResponse> {
-        if let Some(cache) = &self.cache {
-            // Try exact match first
-            if let Some(cached) = cache.get(prompt).await {
-                return Some(cached);
-            }
-
-            // Try similarity search if enabled
-            if let Some(embedding) = self.get_embedding(prompt).await.ok().flatten() {
-                if let Some(similar) = cache.find_similar(embedding, self.config.similarity_threshold).await {
-                    return Some(similar);
-                }
-            }
-        }
-        None
-    }
-
-    /// Update cache with embedding
-    async fn update_cache(&self, prompt: &str, response: LLMResponse) {
-        if let Some(cache) = &self.cache {
-            if let Some(embedding) = self.get_embedding(prompt).await.ok().flatten() {
-                let _ = cache.put_with_embedding(prompt, response, embedding).await;
-            } else {
-                let _ = cache.put(prompt, response).await;
-            }
-        }
-    }
-
-    /// Build conversation context from history
-    fn build_conversation(&self, prompt: &str, history: Option<&[ConversationTurn]>, params: &LLMParams) -> String {
-        let mut conversation = String::new();
-        
-        // Add system prompt if provided
-        if let Some(system) = &params.system_prompt {
-            conversation.push_str(&format!("\nSystem: {}\n", system));
-        }
-        
-        // Add conversation history
-        if let Some(history) = history {
-            for turn in history {
-                match turn.role.as_str() {
-                    "user" => conversation.push_str(&format!("\nUser: {}\n", turn.content)),
-                    "assistant" => conversation.push_str(&format!("\nAssistant: {}\n", turn.content)),
-                    "system" => conversation.push_str(&format!("\nSystem: {}\n", turn.content)),
-                    _ => conversation.push_str(&format!("\n{}: {}\n", turn.role, turn.content)),
-                }
-            }
-        }
-        
-        // Add current prompt
-        conversation.push_str(&format!("\nUser: {}\nAssistant:", prompt));
-        
-        conversation
-    }
-
-    /// Build request payload with conversation history
-    fn build_request(&self, prompt: &str, history: Option<&[ConversationTurn]>, params: &LLMParams) -> serde_json::Value {
-        let conversation = self.build_conversation(prompt, history, params);
-        
-        let mut request = json!({
-            "model": self.config.model,
-            "prompt": conversation,
-            "stream": params.stream,
-            "options": {
-                "temperature": params.temperature,
-                "top_p": params.top_p,
-                "num_predict": params.max_tokens,
-            }
-        });
-
-        // Add any extra parameters
-        for (key, value) in &params.extra_params {
-            request["options"][key] = json!(value);
-        }
-
-        request
-    }
-
-    /// Generate with context building
-    pub async fn generate_with_context_building(
-        &self,
-        query: &str,
-        context_builder: &ContextBuilder,
-        params: &LLMParams,
-    ) -> Result<LLMResponse, LLMError> {
-        // Check cache first with similarity search if enabled
-        if let Some(cache) = &self.cache {
-            if let Some(query_params) = &params.query_params {
-                if let Some(embedding) = self.get_embedding(query).await? {
-                    if let Some(cached_response) = cache.find_similar(
-                        embedding,
-                        self.config.similarity_threshold,
-                    ).await {
-                        return Ok(cached_response);
-                    }
-                }
-            }
-        }
-
-        // Build context if query params are provided
-        let prompt = if let Some(query_params) = &params.query_params {
-            context_builder.build_context(query, query_params).await?
-        } else {
-            query.to_string()
-        };
-
-        // Validate token limits for the full prompt
-        self.validate_token_limits(&prompt, params)?;
-
-        // Generate response
-        let response = self.generate(&prompt, params).await?;
-
-        // Cache response with embedding if enabled
-        if let Some(cache) = &self.cache {
-            if let Some(embedding) = self.get_embedding(query).await? {
-                let _ = cache.put_with_embedding(query, response.clone(), embedding).await;
-            }
-        }
-
-        Ok(response)
     }
 }
 
-#[async_trait]
-impl LLMClient for OllamaClient {
-    async fn initialize(&mut self) -> Result<(), LLMError> {
-        // Validate configuration
-        if self.config.api_endpoint.is_none() {
-            return Err(LLMError::ConfigError("API endpoint not configured".to_string()));
-        }
-
-        // Test model loading
-        let url = self.build_url()?;
-        let response = self.client.post(&url)
-            .json(&json!({
-                "model": self.config.model,
-                "prompt": "test",
-                "stream": false
-            }))
-            .send()
-            .await
-            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let error = response.text().await.unwrap_or_default();
-            return Err(self.map_ollama_error(&error));
-        }
-
-        Ok(())
+/// Map Ollama errors to LLMError
+fn map_ollama_error(error: &str) -> LLMError {
+    if error.contains("rate limit") || error.contains("too many requests") {
+        LLMError::RateLimitExceeded(error.to_string())
+    } else if error.contains("context length") || error.contains("token limit") {
+        LLMError::TokenLimitExceeded(error.to_string())
+    } else if error.contains("model") && (error.contains("not found") || error.contains("failed to load")) {
+        LLMError::ConfigError(format!("Model error: {}", error))
+    } else if error.contains("invalid") {
+        LLMError::InvalidResponse(error.to_string())
+    } else {
+        LLMError::RequestFailed(error.to_string())
     }
-    
-    async fn generate(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        // Check cache first with similarity search
-        if let Some(query_params) = &params.query_params {
-            if let Some(cached) = self.check_cache(prompt, query_params).await {
-                return Ok(cached);
-            }
-        }
+}
 
-        // Validate token limits
-        self.validate_token_limits(prompt, params)?;
+/// Complete text using Ollama API
+pub async fn ollama_complete(
+    prompt: &str,
+    params: &LLMParams,
+    api_endpoint: Option<&str>,
+) -> Result<LLMResponse, LLMError> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
 
-        // Build request URL
-        let url = self.build_url()?;
+    let url = format!("{}/api/generate", 
+        api_endpoint.unwrap_or("http://localhost:11434"));
 
-        // Build request body
-        let request_body = self.build_request(prompt, None, params);
+    let mut request_body = json!({
+        "model": params.model.strip_prefix("ollama/").unwrap_or(&params.model),
+        "prompt": prompt,
+        "temperature": params.temperature,
+        "top_p": params.top_p,
+        "stream": false,
+    });
 
-        // Make request with retries
-        let mut retries = 0;
-        let mut last_error = None;
-        
-        while retries < self.config.max_retries {
-            match self.client.post(&url)
-                .json(&request_body)
-                .send()
-                .await {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            let ollama_response: OllamaResponse = response.json().await
-                                .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
+    // Add system prompt if provided
+    if let Some(system) = &params.system_prompt {
+        request_body["system"] = json!(system);
+    }
 
-                            // Check for API-level errors
-                            self.handle_response_error(&ollama_response)?;
-                                
-                            let response = LLMResponse {
+    // Add extra parameters
+    for (key, value) in &params.extra_params {
+        request_body[key] = json!(value);
+    }
+
+    let response = client.post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let error = response.text().await.unwrap_or_default();
+        return Err(LLMError::RequestFailed(error));
+    }
+
+    let ollama_response: OllamaResponse = response.json()
+        .await
+        .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
+
+    if let Some(error) = ollama_response.error {
+        return Err(map_ollama_error(&error));
+    }
+
+    Ok(LLMResponse {
+        text: ollama_response.response,
+        tokens_used: ollama_response.eval_count.unwrap_or(0),
+        model: params.model.clone(),
+        cached: false,
+        context: None,
+        metadata: HashMap::new(),
+    })
+}
+
+/// Complete text with streaming using Ollama API
+pub async fn ollama_complete_stream(
+    prompt: &str,
+    params: &LLMParams,
+    api_endpoint: Option<&str>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+    let url = format!("{}/api/generate", 
+        api_endpoint.unwrap_or("http://localhost:11434"));
+
+    let mut request_body = json!({
+        "model": params.model.strip_prefix("ollama/").unwrap_or(&params.model),
+        "prompt": prompt,
+        "temperature": params.temperature,
+        "top_p": params.top_p,
+        "stream": true,
+    });
+
+    // Add system prompt if provided
+    if let Some(system) = &params.system_prompt {
+        request_body["system"] = json!(system);
+    }
+
+    // Add extra parameters
+    for (key, value) in &params.extra_params {
+        request_body[key] = json!(value);
+    }
+
+    let response = client.post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let error = response.text().await.unwrap_or_default();
+        return Err(LLMError::RequestFailed(error));
+    }
+
+    let (tx, rx) = mpsc::channel(32);
+    let start_time = Instant::now();
+
+    tokio::spawn(async move {
+        let mut stream = response.bytes_stream();
+        let mut total_tokens = 0;
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    match serde_json::from_slice::<OllamaStreamResponse>(&chunk) {
+                        Ok(ollama_response) => {
+                            if let Some(error) = ollama_response.error {
+                                let _ = tx.send(Err(map_ollama_error(&error))).await;
+                                break;
+                            }
+
+                            let timing = StreamingTiming {
+                                chunk_duration: ollama_response.eval_duration.unwrap_or(0),
+                                total_duration: ollama_response.total_duration.unwrap_or(0),
+                                prompt_eval_duration: Some(ollama_response.prompt_eval_count.unwrap_or(0) as u64),
+                                token_gen_duration: Some(ollama_response.eval_duration.unwrap_or(0)),
+                            };
+
+                            total_tokens += ollama_response.eval_count.unwrap_or(0);
+
+                            let stream_response = StreamingResponse {
                                 text: ollama_response.response,
-                                tokens_used: ollama_response.prompt_eval_count + ollama_response.eval_count,
-                                model: self.config.model.clone(),
-                                cached: false,
-                                context: None,
+                                done: ollama_response.done,
+                                timing: Some(timing),
+                                chunk_tokens: ollama_response.eval_count.unwrap_or(0),
+                                total_tokens,
                                 metadata: HashMap::new(),
                             };
 
-                            // Update cache with embedding
-                            self.update_cache(prompt, response.clone()).await;
-
-                            return Ok(response);
-                        } else {
-                            let error = response.text().await.unwrap_or_default();
-                            if error.contains("rate limit") {
-                                return Err(LLMError::RateLimitExceeded(error));
+                            if tx.send(Ok(stream_response)).await.is_err() {
+                                break;
                             }
-                            last_error = Some(LLMError::RequestFailed(error));
+
+                            if ollama_response.done {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(LLMError::InvalidResponse(e.to_string()))).await;
+                            break;
                         }
                     }
-                    Err(e) => {
-                        last_error = Some(LLMError::RequestFailed(e.to_string()));
-                    }
                 }
-
-            retries += 1;
-            if retries < self.config.max_retries {
-                tokio::time::sleep(Duration::from_secs(1 << retries)).await;
+                Err(e) => {
+                    let _ = tx.send(Err(LLMError::RequestFailed(e.to_string()))).await;
+                    break;
+                }
             }
         }
+    });
 
-        Err(last_error.unwrap_or_else(|| LLMError::RequestFailed("Max retries exceeded".to_string())))
+    Ok(Box::pin(ReceiverStream::new(rx)))
+}
+
+/// Complete multiple prompts in batch using Ollama API
+pub async fn ollama_complete_batch(
+    prompts: &[String],
+    params: &LLMParams,
+    api_endpoint: Option<&str>,
+) -> Result<Vec<LLMResponse>, LLMError> {
+    let mut responses = Vec::with_capacity(prompts.len());
+    
+    for prompt in prompts {
+        let response = ollama_complete(prompt, params, api_endpoint).await?;
+        responses.push(response);
+    }
+    
+    Ok(responses)
+}
+
+/// Ollama provider implementation
+pub struct OllamaProvider {
+    config: ProviderConfig,
+    client: Arc<Client>,
+    rate_limiter: Arc<RwLock<Option<RateLimiter>>>,
+}
+
+impl OllamaProvider {
+    pub fn new(config: ProviderConfig) -> Result<Self, LLMError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| LLMError::ConfigError(e.to_string()))?;
+
+        Ok(Self {
+            config,
+            client: Arc::new(client),
+            rate_limiter: Arc::new(RwLock::new(None)),
+        })
     }
 
-    async fn generate_with_history(
-        &self,
-        prompt: &str,
-        history: &[ConversationTurn],
-        params: &LLMParams
-    ) -> Result<LLMResponse, LLMError> {
-        // Check cache first if enabled
-        if let Some(cache) = &self.cache {
-            // Create a cache key that includes history
-            let cache_key = format!("{:?}:{}", history, prompt);
-            if let Some(cached_response) = cache.get(&cache_key).await {
-                return Ok(cached_response);
-            }
-        }
+    // Helper function to estimate token count
+    fn estimate_tokens(&self, text: &str) -> u32 {
+        // Simple estimation: ~4 characters per token
+        (text.len() as f32 / 4.0).ceil() as u32
+    }
+}
 
-        // Estimate tokens and check rate limits
-        let estimated_tokens = prompt.split_whitespace().count() as u32 + 
-            history.iter().map(|turn| turn.content.split_whitespace().count() as u32).sum::<u32>() +
-            params.max_tokens as u32;
-        
-        self.check_rate_limit(estimated_tokens).await?;
-
-        // Build request
-        let url = self.build_url()?;
-        let request_body = self.build_request(prompt, Some(history), params);
-
-        let response = self.client.post(&url)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
-
-        if response.status().is_success() {
-            let ollama_response: OllamaResponse = response.json().await
-                .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
-
-            // Check for API-level errors
-            self.handle_response_error(&ollama_response)?;
-
-            let response = LLMResponse {
-                text: ollama_response.response,
-                tokens_used: ollama_response.prompt_eval_count + ollama_response.eval_count,
-                model: self.config.model.clone(),
-                cached: false,
-                context: None,
-                metadata: {
-                    let mut map = HashMap::new();
-                    map.insert("total_duration".to_string(), ollama_response.total_duration.to_string());
-                    map.insert("load_duration".to_string(), ollama_response.load_duration.to_string());
-                    map.insert("eval_duration".to_string(), ollama_response.eval_duration.to_string());
-                    map.insert("prompt_eval_count".to_string(), ollama_response.prompt_eval_count.to_string());
-                    map.insert("eval_count".to_string(), ollama_response.eval_count.to_string());
-                    map
-                },
-            };
-
-            // Update cache if enabled
-            if let Some(cache) = &self.cache {
-                let cache_key = format!("{:?}:{}", history, prompt);
-                let _ = cache.put(&cache_key, response.clone()).await;
-            }
-
-            Ok(response)
-        } else {
-            let error = response.text().await.unwrap_or_default();
-            Err(self.map_ollama_error(&error))
-        }
+#[async_trait::async_trait]
+impl Provider for OllamaProvider {
+    async fn initialize(&mut self) -> Result<(), LLMError> {
+        Ok(())
     }
 
-    async fn generate_stream(
-        &self,
-        prompt: &str,
-        params: &LLMParams,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
-        // Validate token limits
-        self.validate_token_limits(prompt, params)?;
+    async fn complete(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
+        // Check rate limit if configured
+        if let Some(rate_limiter) = &*self.rate_limiter.read().await {
+            let estimated_tokens = self.estimate_tokens(prompt) + params.max_tokens as u32;
+            rate_limiter.acquire_permit(estimated_tokens).await?;
+        }
 
-        let url = self.build_url()?;
-        let model = self.config.model.clone();
+        let url = format!("{}/api/generate", 
+            self.config.api_endpoint.as_deref().unwrap_or("http://localhost:11434"));
 
         let mut request_body = json!({
-            "model": model,
+            "model": params.model.strip_prefix("ollama/").unwrap_or(&params.model),
             "prompt": prompt,
-            "stream": true,
-            "options": {
-                "temperature": params.temperature,
-                "top_p": params.top_p,
-                "num_predict": params.max_tokens,
-            }
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "stream": false,
         });
 
         // Add system prompt if provided
-        if let Some(system_prompt) = &params.system_prompt {
-            request_body["system"] = json!(system_prompt);
+        if let Some(system) = &params.system_prompt {
+            request_body["system"] = json!(system);
         }
 
         // Add extra parameters
         for (key, value) in &params.extra_params {
-            request_body["options"][key] = serde_json::Value::String(value.clone());
+            request_body[key] = json!(value);
         }
 
         let response = self.client.post(&url)
@@ -528,64 +374,148 @@ impl LLMClient for OllamaClient {
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
-            return Err(self.map_ollama_error(&error));
+            return Err(LLMError::RequestFailed(error));
         }
 
-        let stream = response.bytes_stream();
-        let mut processor = StreamProcessor::new(StreamConfig {
-            enable_batching: true,
-            max_batch_size: 8192,
-            max_batch_wait_ms: 50,
-            ..Default::default()
+        let ollama_response: OllamaResponse = response.json()
+            .await
+            .map_err(|e| LLMError::InvalidResponse(e.to_string()))?;
+
+        if let Some(error) = ollama_response.error {
+            return Err(map_ollama_error(&error));
+        }
+
+        Ok(LLMResponse {
+            text: ollama_response.response,
+            tokens_used: ollama_response.eval_count.unwrap_or(0),
+            model: params.model.clone(),
+            cached: false,
+            context: None,
+            metadata: HashMap::new(),
+        })
+    }
+
+    async fn complete_stream(
+        &self,
+        prompt: &str,
+        params: &LLMParams,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        // Check rate limit if configured
+        if let Some(rate_limiter) = &*self.rate_limiter.read().await {
+            let estimated_tokens = self.estimate_tokens(prompt) + params.max_tokens as u32;
+            rate_limiter.acquire_permit(estimated_tokens).await?;
+        }
+
+        let url = format!("{}/api/generate", 
+            self.config.api_endpoint.as_deref().unwrap_or("http://localhost:11434"));
+
+        let mut request_body = json!({
+            "model": params.model.strip_prefix("ollama/").unwrap_or(&params.model),
+            "prompt": prompt,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "stream": true,
         });
 
-        // Create async parser for Ollama stream format
-        let parser = |text: &str| -> futures::future::BoxFuture<'static, Result<Option<(String, bool, std::collections::HashMap<String, String>)>, LLMError>> {
-            let owned_text = text.to_owned();
-            Box::pin(async move {
-                match serde_json::from_str::<OllamaStreamResponse>(&owned_text) {
-                    Ok(response) => {
-                        let mut metadata = std::collections::HashMap::new();
-                        if let Some(total_duration) = response.total_duration {
-                            metadata.insert("total_duration".to_string(), total_duration.to_string());
-                        }
-                        if let Some(load_duration) = response.load_duration {
-                            metadata.insert("load_duration".to_string(), load_duration.to_string());
-                        }
-                        if let Some(eval_count) = response.eval_count {
-                            metadata.insert("eval_count".to_string(), eval_count.to_string());
-                        }
-                        if let Some(eval_duration) = response.eval_duration {
-                            metadata.insert("eval_duration".to_string(), eval_duration.to_string());
-                        }
+        // Add system prompt if provided
+        if let Some(system) = &params.system_prompt {
+            request_body["system"] = json!(system);
+        }
 
-                        Ok(Some((response.response, response.done, metadata)))
+        // Add extra parameters
+        for (key, value) in &params.extra_params {
+            request_body[key] = json!(value);
+        }
+
+        let response = self.client.post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError::RequestFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(LLMError::RequestFailed(error));
+        }
+
+        let (tx, rx) = mpsc::channel(32);
+        let model = params.model.clone();
+        let start_time = Instant::now();
+
+        tokio::spawn(async move {
+            let mut stream = response.bytes_stream();
+            let mut total_tokens = 0;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        match serde_json::from_slice::<OllamaStreamResponse>(&chunk) {
+                            Ok(ollama_response) => {
+                                if let Some(error) = ollama_response.error {
+                                    let _ = tx.send(Err(map_ollama_error(&error))).await;
+                                    break;
+                                }
+
+                                let timing = StreamingTiming {
+                                    chunk_duration: ollama_response.eval_duration.unwrap_or(0),
+                                    total_duration: ollama_response.total_duration.unwrap_or(0),
+                                    prompt_eval_duration: Some(ollama_response.prompt_eval_count.unwrap_or(0) as u64),
+                                    token_gen_duration: Some(ollama_response.eval_duration.unwrap_or(0)),
+                                };
+
+                                total_tokens += ollama_response.eval_count.unwrap_or(0);
+
+                                let stream_response = StreamingResponse {
+                                    text: ollama_response.response,
+                                    done: ollama_response.done,
+                                    timing: Some(timing),
+                                    chunk_tokens: ollama_response.eval_count.unwrap_or(0),
+                                    total_tokens,
+                                    metadata: HashMap::new(),
+                                };
+
+                                if tx.send(Ok(stream_response)).await.is_err() {
+                                    break;
+                                }
+
+                                if ollama_response.done {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(LLMError::InvalidResponse(e.to_string()))).await;
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => Err(LLMError::InvalidResponse(e.to_string())),
+                    Err(e) => {
+                        let _ = tx.send(Err(LLMError::RequestFailed(e.to_string()))).await;
+                        break;
+                    }
                 }
-            })
-        };
+            }
+        });
 
-        Ok(processor.process_stream(stream, parser).await)
+        Ok(Box::pin(ReceiverStream::new(rx)))
     }
-    
-    async fn batch_generate(
+
+    async fn complete_batch(
         &self,
         prompts: &[String],
         params: &LLMParams,
     ) -> Result<Vec<LLMResponse>, LLMError> {
         let mut responses = Vec::with_capacity(prompts.len());
         for prompt in prompts {
-            responses.push(self.generate(prompt, params).await?);
+            responses.push(self.complete(prompt, params).await?);
         }
         Ok(responses)
     }
-    
-    fn get_config(&self) -> &LLMConfig {
+
+    fn get_config(&self) -> &ProviderConfig {
         &self.config
     }
-    
-    fn update_config(&mut self, config: LLMConfig) -> Result<(), LLMError> {
+
+    fn update_config(&mut self, config: ProviderConfig) -> Result<(), LLMError> {
         self.config = config;
         Ok(())
     }

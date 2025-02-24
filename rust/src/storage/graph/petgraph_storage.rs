@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use crate::types::{Result, Config, Error, KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge};
+use crate::types::error::{Error, Result};
+use crate::types::{Config, KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
@@ -405,7 +406,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result containing a vector of NodeData for all nodes within the specified depth
-    pub async fn get_neighborhood(&self, node_id: &str, depth: u32) -> crate::types::Result<Vec<NodeData>> {
+    pub async fn get_neighborhood(&self, node_id: &str, depth: u32) -> Result<Vec<NodeData>> {
         let start_idx = self.node_map.get(node_id)
             .ok_or_else(|| crate::types::Error::Storage(format!("Node {} not found", node_id)))?;
         
@@ -443,7 +444,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result containing a new PetgraphStorage instance representing the subgraph
-    pub async fn extract_subgraph(&self, node_ids: &[String]) -> crate::types::Result<PetgraphStorage> {
+    pub async fn extract_subgraph(&self, node_ids: &[String]) -> Result<PetgraphStorage> {
         let node_set: HashSet<String> = node_ids.iter().cloned().collect();
         let mut new_graph = petgraph::Graph::<NodeData, EdgeData>::new();
         let mut new_node_map = HashMap::new();
@@ -484,7 +485,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result containing a vector of PatternMatch objects representing the matches found
-    pub async fn match_pattern(&self, pattern: GraphPattern) -> crate::types::Result<Vec<PatternMatch>> {
+    pub async fn match_pattern(&self, pattern: GraphPattern) -> Result<Vec<PatternMatch>> {
         let mut matches = Vec::new();
         // A simple implementation: filter nodes where any attribute contains the keyword
         if let Some(ref keyword) = pattern.keyword {
@@ -615,7 +616,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result containing the combined degree or an error if the edge doesn't exist
-    pub fn edge_degree(&self, source_id: &str, target_id: &str) -> crate::types::Result<usize> {
+    pub fn edge_degree(&self, source_id: &str, target_id: &str) -> Result<usize> {
         if let (Some(&src_idx), Some(&tgt_idx)) = (self.node_map.get(source_id), self.node_map.get(target_id)) {
             let deg_src = self.graph.edges(src_idx).count();
             let deg_tgt = self.graph.edges(tgt_idx).count();
@@ -636,7 +637,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub async fn upsert_nodes_impl(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> crate::types::Result<()> {
+    pub async fn upsert_nodes_impl(&mut self, nodes: Vec<(String, HashMap<String, serde_json::Value>)>) -> Result<()> {
         let mut graph = self.graph.clone();
         let mut node_map = self.node_map.clone();
 
@@ -672,7 +673,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub async fn upsert_edges_impl(&mut self, edges: Vec<(String, String, EdgeData)>) -> crate::types::Result<()> {
+    pub async fn upsert_edges_impl(&mut self, edges: Vec<(String, String, EdgeData)>) -> Result<()> {
         let mut graph = self.graph.clone();
         let node_map = self.node_map.clone();
 
@@ -702,7 +703,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub async fn remove_nodes_impl(&mut self, node_ids: Vec<String>) -> crate::types::Result<()> {
+    pub async fn remove_nodes_impl(&mut self, node_ids: Vec<String>) -> Result<()> {
         let mut graph = self.graph.clone();
         let mut node_map = self.node_map.clone();
 
@@ -728,7 +729,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of the operation
-    pub async fn remove_edges_impl(&mut self, edges: Vec<(String, String)>) -> crate::types::Result<()> {
+    pub async fn remove_edges_impl(&mut self, edges: Vec<(String, String)>) -> Result<()> {
         for (src, tgt) in edges {
             self.delete_edge_impl(&src, &tgt).await?;
         }
@@ -812,7 +813,7 @@ impl PetgraphStorage {
     /// 
     /// # Returns
     /// A Result indicating success or failure of post-indexing operations
-    pub async fn index_done_callback(&mut self) -> crate::types::Result<()> {
+    pub async fn index_done_callback(&mut self) -> Result<()> {
         self.save_graph()?;
         Ok(())
     }

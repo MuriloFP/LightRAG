@@ -177,7 +177,7 @@ impl RateLimiter {
     }
     
     /// Try to acquire permission for a request with token count
-    pub async fn try_acquire(&self, tokens: u32) -> Result<RateLimit, RateLimitError> {
+    pub async fn acquire_permit(&self, tokens: u32) -> Result<RateLimit, RateLimitError> {
         // Check concurrent requests
         let mut concurrent = self.concurrent_requests.write().await;
         if *concurrent >= self.config.max_concurrent {

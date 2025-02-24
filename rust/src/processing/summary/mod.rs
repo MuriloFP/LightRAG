@@ -21,6 +21,12 @@ pub enum SummaryError {
     /// Error generating summary
     #[error("Generation error: {0}")]
     GenerationError(String),
+    /// Failed to generate summary
+    #[error("Failed to generate summary: {0}")]
+    GenerationFailed(String),
+    /// Failed to extract keywords
+    #[error("Failed to extract keywords: {0}")]
+    KeywordExtractionFailed(String),
 }
 
 /// Types of summary generation

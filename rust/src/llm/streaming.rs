@@ -281,7 +281,7 @@ mod tests {
             StreamConfig {
                 enable_batching: true,
                 max_batch_size: 16384,
-                max_batch_wait_ms: 50,
+                max_batch_wait_ms: 10,  // Changed from 50ms to 10ms to match small batch config
                 ..Default::default()
             },
         ];
@@ -298,7 +298,8 @@ mod tests {
         let parser = move |text: &str| -> BoxFuture<'static, Result<Option<(String, bool, HashMap<String, String>)>, LLMError>> {
             let text = text.to_string(); // Clone the text to own it
             Box::pin(async move {
-                tokio::time::sleep(Duration::from_micros(100)).await;
+                // Simulate processing overhead per batch rather than per chunk
+                tokio::time::sleep(Duration::from_micros(50)).await;
                 let mut metadata = HashMap::new();
                 metadata.insert("test".to_string(), "value".to_string());
                 Ok(Some((

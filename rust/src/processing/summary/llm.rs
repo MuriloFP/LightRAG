@@ -3,13 +3,21 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+use md5;
+use std::time::Duration;
+use std::panic::AssertUnwindSafe;
+use futures::FutureExt;
 
-use crate::types::llm::{LLMClient, LLMParams};
+use crate::llm::{Provider, LLMParams, LLMResponse, LLMError};
+use crate::llm::cache::backend::CacheBackend;
+use crate::llm::cache::types::{CacheEntry, CacheValue, CacheMetadata};
 use crate::processing::keywords::{KeywordExtractor, LLMKeywordExtractor, KeywordConfig};
+use crate::types::llm::QueryParams;
 use super::{
     ContentSummarizer, Summary, SummaryConfig, SummaryError, SummaryMetadata,
     BasicSummarizer,
 };
+use crate::types::error::Error;
 
 /// Configuration for LLM-based summarization
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,53 +71,66 @@ impl Default for LLMSummaryConfig {
     }
 }
 
-/// LLM-based implementation of content summarization
+/// LLM-based summarizer implementation
 pub struct LLMSummarizer {
-    /// Configuration
+    /// LLM provider
+    provider: Arc<Box<dyn Provider>>,
+    
+    /// Summarizer configuration
     config: LLMSummaryConfig,
     
-    /// LLM client
-    llm_client: Arc<dyn LLMClient>,
+    /// Keyword extractor
+    keyword_extractor: Option<Arc<LLMKeywordExtractor>>,
     
     /// Fallback summarizer
-    fallback: BasicSummarizer,
-    
-    /// Keyword extractor
-    keyword_extractor: Option<LLMKeywordExtractor>,
+    fallback: Arc<BasicSummarizer>,
     
     /// Response cache
-    cache: Option<Arc<RwLock<HashMap<String, Summary>>>>,
+    cache: Arc<dyn CacheBackend>,
 }
 
 impl LLMSummarizer {
-    /// Create a new LLMSummarizer with the given configuration and client
-    pub fn new(config: LLMSummaryConfig, llm_client: Arc<dyn LLMClient>) -> Self {
+    /// Create a new LLM summarizer
+    pub fn new(
+        provider: Box<dyn Provider>,
+        config: LLMSummaryConfig,
+        cache: Box<dyn CacheBackend>,
+    ) -> Self {
         let keyword_extractor = if config.extract_keywords {
-            Some(LLMKeywordExtractor::new(
-                KeywordConfig {
-                    max_high_level: 5,
-                    max_low_level: 10,
-                    language: Some(config.language.clone()),
-                    use_llm: true,
-                    extra_params: Default::default(),
-                },
-                Arc::clone(&llm_client),
-                config.llm_params.clone(),
-            ))
+            let keyword_config = KeywordConfig {
+                max_high_level: 5,
+                max_low_level: 10,
+                language: Some(config.language.clone()),
+                use_llm: true,
+                extra_params: Default::default(),
+            };
+            // Create a new provider instance for the keyword extractor
+            let provider_config = provider.get_config().clone();
+            let provider_type = match provider_config.model.split('/').next() {
+                Some("openai") => "openai",
+                Some("anthropic") => "anthropic",
+                Some("ollama") => "ollama",
+                _ => "openai", // default to OpenAI
+            };
+            if let Ok(new_provider) = crate::llm::create_provider(provider_type, provider_config) {
+                Some(Arc::new(LLMKeywordExtractor::new(
+                    keyword_config,
+                    Arc::new(new_provider),
+                    config.llm_params.clone(),
+                )))
+            } else {
+                None
+            }
         } else {
             None
         };
 
         Self {
+            provider: Arc::new(provider),
             config: config.clone(),
-            llm_client,
-            fallback: BasicSummarizer::new(config.base_config),
             keyword_extractor,
-            cache: if config.use_cache { 
-                Some(Arc::new(RwLock::new(HashMap::new()))) 
-            } else { 
-                None 
-            },
+            fallback: Arc::new(BasicSummarizer::new(config.base_config.clone())),
+            cache: Arc::from(cache),
         }
     }
     
@@ -129,19 +150,128 @@ impl LLMSummarizer {
     
     /// Try to get summary from cache
     async fn get_cached_summary(&self, content: &str) -> Option<Summary> {
-        if let Some(cache) = &self.cache {
-            let cache_read = cache.read().await;
-            cache_read.get(content).cloned()
-        } else {
-            None
+        let cache_key = format!("summary:{:x}", md5::compute(content.as_bytes()));
+        if let Ok(entry) = self.cache.get(&cache_key).await {
+            if let CacheValue::Response(response) = entry.value {
+                return Some(Summary {
+                    text: response.text.clone(),
+                    metadata: SummaryMetadata {
+                        original_length: content.len(),
+                        summary_length: response.text.len(),
+                        original_tokens: Some(response.tokens_used),
+                        summary_tokens: Some(self.config.llm_params.max_tokens),
+                        keywords: None,
+                    },
+                });
+            }
         }
+        None
     }
     
     /// Cache a generated summary
-    async fn cache_summary(&self, content: &str, summary: Summary) {
-        if let Some(cache) = &self.cache {
-            let mut cache_write = cache.write().await;
-            cache_write.insert(content.to_string(), summary);
+    async fn cache_summary(&self, content: &str, summary: &Summary) {
+        let cache_key = format!("summary:{:x}", md5::compute(content.as_bytes()));
+        let cache_entry = CacheEntry::new(
+            cache_key,
+            CacheValue::Response(LLMResponse {
+                text: summary.text.clone(),
+                tokens_used: summary.metadata.original_tokens.unwrap_or(0),
+                model: self.config.llm_params.model.clone(),
+                cached: false,
+                context: None,
+                metadata: HashMap::new(),
+            }),
+            Some(Duration::from_secs(3600)), // 1 hour TTL
+            None,
+        );
+        let _ = self.cache.set(cache_entry).await;
+    }
+
+    async fn try_generate_summary(&self, content: &str) -> Result<Summary, SummaryError> {
+        let response = self.provider
+            .complete(&self.generate_prompt(content), &self.config.llm_params)
+            .await
+            .map_err(|e| SummaryError::GenerationFailed(e.to_string()))?;
+
+        // Extract keywords if configured
+        let keywords = if let Some(extractor) = &self.keyword_extractor {
+            match extractor.extract_keywords(content).await {
+                Ok(extracted) => Some(extracted.high_level.into_iter()
+                    .chain(extracted.low_level.into_iter())
+                    .collect()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let text = response.text;
+        let text_len = text.len();
+        let summary = Summary {
+            text,
+            metadata: SummaryMetadata {
+                original_length: content.len(),
+                summary_length: text_len,
+                original_tokens: Some(response.tokens_used),
+                summary_tokens: Some(self.config.llm_params.max_tokens),
+                keywords,
+            },
+        };
+
+        // Try fallback if enabled and summary is empty
+        if summary.text.is_empty() && self.config.use_fallback {
+            return self.fallback.generate_summary(content).await;
+        }
+
+        Ok(summary)
+    }
+
+    pub async fn generate_summary(&self, content: &str) -> Result<Summary, SummaryError> {
+        if content.trim().is_empty() {
+            return Err(SummaryError::EmptyContent);
+        }
+
+        // Prepare the prompt for summarization
+        let prompt = format!("Summarize the content:\n{}", content);
+        
+        // Prepare LLM parameters.
+        let params = LLMParams {
+            model: self.config.llm_params.model.clone(),
+            max_tokens: self.config.llm_params.max_tokens,
+            temperature: self.config.llm_params.temperature,
+            top_p: self.config.llm_params.top_p,
+            stream: false,
+            system_prompt: None,
+            query_params: None,
+            extra_params: std::collections::HashMap::new(),
+        };
+ 
+        // Attempt to call the provider.complete method inside a catch_unwind block to catch panics
+        let provider_call = AssertUnwindSafe(self.provider.complete(&prompt, &params)).catch_unwind();
+        let result = provider_call.await;
+        
+        match result {
+            Ok(Ok(response)) => {
+                let text = response.text;
+                let summary = Summary {
+                    text: text.clone(),
+                    metadata: SummaryMetadata {
+                        original_length: content.len(),
+                        summary_length: text.len(),
+                        original_tokens: Some(response.tokens_used),
+                        summary_tokens: Some(self.config.llm_params.max_tokens),
+                        keywords: None,
+                    },
+                };
+                Ok(summary)
+            },
+            _ => {
+                if self.config.use_fallback {
+                    self.fallback.generate_summary(content).await
+                } else {
+                    Err(SummaryError::GenerationFailed("LLM provider failed".to_string()))
+                }
+            }
         }
     }
 }
@@ -152,67 +282,71 @@ impl ContentSummarizer for LLMSummarizer {
         if content.is_empty() {
             return Err(SummaryError::EmptyContent);
         }
+
+        let cache_key = format!("summary:{:x}", md5::compute(content.as_bytes()));
         
         // Check cache first
-        if let Some(cached) = self.get_cached_summary(content).await {
-            return Ok(cached);
-        }
-        
-        let original_length = content.len();
-        let mut retries = 0;
-        
-        // Try LLM-based summary with retries
-        while retries < self.config.max_retries {
-            match self.llm_client.generate(
-                &self.generate_prompt(content),
-                &self.config.llm_params
-            ).await {
-                Ok(llm_response) => {
-                    // Extract keywords if configured
-                    let keywords = if let Some(extractor) = &self.keyword_extractor {
-                        match extractor.extract_keywords(content).await {
-                            Ok(extracted) => Some(extracted.high_level.into_iter()
-                                .chain(extracted.low_level.into_iter())
-                                .collect()),
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    };
-                    
-                    let summary_length = llm_response.text.len();
-                    let summary = Summary {
-                        text: llm_response.text,
+        if self.config.use_cache {
+            if let Ok(cached_entry) = self.cache.get(&cache_key).await {
+                if let CacheValue::Response(response) = cached_entry.value {
+                    let text = response.text;
+                    let text_len = text.len();
+                    return Ok(Summary {
+                        text,
                         metadata: SummaryMetadata {
-                            original_length,
-                            summary_length,
-                            original_tokens: Some(llm_response.tokens_used),
+                            original_length: content.len(),
+                            summary_length: text_len,
+                            original_tokens: Some(response.tokens_used),
                             summary_tokens: Some(self.config.llm_params.max_tokens),
-                            keywords,
+                            keywords: None,
                         },
-                    };
-                    
-                    // Cache the summary if enabled
-                    if self.config.use_cache {
-                        self.cache_summary(content, summary.clone()).await;
-                    }
-                    
-                    return Ok(summary);
+                    });
                 }
-                Err(_e) if retries < self.config.max_retries - 1 => {
-                    retries += 1;
-                    continue;
-                }
-                Err(_e) if self.config.use_fallback => {
-                    // Use fallback summarizer on final retry
-                    return self.fallback.generate_summary(content).await;
-                }
-                Err(e) => return Err(SummaryError::GenerationError(e.to_string())),
             }
         }
-        
-        // This should never be reached due to the error handling above
-        Err(SummaryError::GenerationError("Maximum retries exceeded".to_string()))
+
+        let mut retries = 0;
+        let mut last_error = None;
+
+        while retries <= self.config.max_retries {
+            match self.try_generate_summary(content).await {
+                Ok(summary) => {
+                    // Cache the successful result
+                    if self.config.use_cache {
+                        let cache_entry = CacheEntry::new(
+                            cache_key.clone(),
+                            CacheValue::Response(LLMResponse {
+                                text: summary.text.clone(),
+                                tokens_used: summary.metadata.original_tokens.unwrap_or(0),
+                                model: self.config.llm_params.model.clone(),
+                                cached: false,
+                                context: None,
+                                metadata: HashMap::new(),
+                            }),
+                            Some(Duration::from_secs(3600)), // 1 hour TTL
+                            None,
+                        );
+                        let _ = self.cache.set(cache_entry).await;
+                    }
+                    return Ok(summary);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    retries += 1;
+                    
+                    if retries <= self.config.max_retries {
+                        tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(retries as u32))).await;
+                    }
+                }
+            }
+        }
+
+        // If we get here, all retries failed
+        if let Some(e) = last_error {
+            Err(e)
+        } else {
+            Err(SummaryError::GenerationFailed("All retries failed".to_string()))
+        }
     }
     
     fn get_config(&self) -> &SummaryConfig {

@@ -15,6 +15,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bincode = "1.3"
 
 # Bytes and IO
 bytes = "1.5"
@@ -62,7 +63,7 @@ docx-rs = "0.4"
 # Vector Operations
 ndarray = "0.15"
 nalgebra = "0.32"
-rand = "0.8"
+rand = { version = "0.8", features = ["std"] }
 
 # Graph Operations
 petgraph = "0.6"
@@ -81,6 +82,23 @@ lazy_static = "1.4.0"
 # Distributed Caching
 redis = { version = "0.23", features = ["tokio-comp", "r2d2"] }
 r2d2 = "0.8"
+r2d2_redis = "0.14"
+
+# Storage
+rusqlite = { version = "0.30", features = ["bundled", "backup", "blob", "array"] }
+tokio-rusqlite = "0.5"
+
+# Encryption
+aes-gcm = { version = "0.10.3", features = ["std"] }
+chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+
+# Added from the code block
+flate2 = "1.0"
+
+# Added dependencies
+generic-array = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -97,6 +115,7 @@ default = []
 compression = []
 wasm = ["wasm-bindgen"]
 mobile = []
+redis = []
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

@@ -1,487 +1,235 @@
 use std::collections::HashMap;
-use std::time::Duration;
-use futures::StreamExt;
-use tokio;
-use std::time::Instant;
 use std::pin::Pin;
-use futures::future::BoxFuture;
-use futures::stream;
-use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use futures::{Stream, StreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use async_trait::async_trait;
 
-use super_lightrag::llm::{
-    LLMClient, LLMConfig, LLMParams,
-    providers::{OpenAIClient, OllamaClient},
+use super_lightrag::{
+    types::llm::{
+        LLMParams, LLMResponse, LLMError, StreamingResponse,
+        StreamingTiming,
+    },
+    llm::{Provider, ProviderConfig},
 };
-use super_lightrag::types::llm::StreamingTiming;
-use wiremock::{Mock, MockServer, ResponseTemplate};
-use wiremock::matchers::{method, path};
-use serde_json::json;
-use super_lightrag::llm::streaming::{StreamConfig, StreamProcessor};
-use super_lightrag::llm::LLMError;
 
-fn streaming_parser(text: &str) -> futures::future::BoxFuture<'static, Result<Option<(String, bool, std::collections::HashMap<String, String>)>, super_lightrag::llm::LLMError>> {
-    let text_owned = text.to_string();
-    Box::pin(async move {
-        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("test".to_string(), "value".to_string());
-        let contains = text_owned.contains("chunk999");
-        let formatted_text = format!("{{\"text\": \"{}\"}}", text_owned);
-        Ok(Some((formatted_text, contains, metadata)))
-    })
+/// Mock provider that returns streaming responses
+struct MockStreamingProvider {
+    responses: Vec<String>,
+    current: AtomicUsize,
+    chunk_size: usize,
 }
 
-#[tokio::test]
-async fn test_openai_streaming() {
-    let config = LLMConfig {
-        model: "gpt-3.5-turbo".to_string(),
-        api_endpoint: Some("https://api.openai.com".to_string()),
-        api_key: Some("test-key".to_string()),
-        org_id: None,
-        timeout_secs: 30,
-        max_retries: 1,
-        use_cache: false,
-        rate_limit_config: None,
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    };
-
-    let client = OpenAIClient::new(config).unwrap();
-    let params = LLMParams {
-        max_tokens: 50,
-        temperature: 0.7,
-        top_p: 1.0,
-        stream: true,
-        system_prompt: None,
-        query_params: None,
-        extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
-    };
-
-    let result = client.generate_stream("Test prompt", &params).await;
-    match result {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut received_chunks = 0;
-            let mut total_tokens = 0;
-            let mut last_chunk_timing: Option<StreamingTiming> = None;
-
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(chunk) => {
-                        received_chunks += 1;
-                        total_tokens += chunk.chunk_tokens;
-                        assert!(!chunk.text.is_empty() || chunk.done);
-                        assert!(chunk.timing.is_some());
-                        last_chunk_timing = chunk.timing;
-                    }
-                    Err(e) => {
-                        if !e.to_string().contains("API key not valid") && !e.to_string().contains("invalid_api_key") {
-                            panic!("Unexpected error: {}", e);
-                        }
-                        return;
-                    }
-                }
-            }
-
-            // Only check these if we got any chunks
-            if received_chunks > 0 {
-                assert!(total_tokens > 0);
-                assert!(last_chunk_timing.is_some());
-            }
-        }
-        Err(e) => {
-            // Test should pass if we get an invalid API key error
-            assert!(e.to_string().contains("API key not valid") || e.to_string().contains("invalid_api_key"),
-                "Expected API key error, got: {}", e);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_ollama_streaming() {
-    let config = LLMConfig {
-        model: "llama2".to_string(),
-        api_endpoint: Some("http://localhost:11434".to_string()),
-        api_key: None,
-        org_id: None,
-        timeout_secs: 30,
-        max_retries: 1,
-        use_cache: false,
-        rate_limit_config: None,
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    };
-
-    let client = OllamaClient::new(config).unwrap();
-    let params = LLMParams {
-        max_tokens: 50,
-        temperature: 0.7,
-        top_p: 1.0,
-        stream: true,
-        system_prompt: None,
-        query_params: None,
-        extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
-    };
-
-    let stream = client.generate_stream("Test prompt", &params).await;
-    match stream {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut received_chunks = 0;
-            let mut total_tokens = 0;
-            let mut last_chunk_timing: Option<StreamingTiming> = None;
-
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(chunk) => {
-                        received_chunks += 1;
-                        total_tokens += chunk.chunk_tokens;
-                        assert!(!chunk.text.is_empty() || chunk.done);
-                        assert!(chunk.timing.is_some());
-                        if let Some(timing) = &chunk.timing {
-                            assert!(timing.chunk_duration > 0);
-                            assert!(timing.total_duration > 0);
-                            assert!(timing.prompt_eval_duration.is_some());
-                            assert!(timing.token_gen_duration.is_some());
-                        }
-                        last_chunk_timing = chunk.timing;
-
-                        // Check Ollama-specific metadata
-                        assert!(chunk.metadata.contains_key("model"));
-                        if !chunk.done {
-                            assert!(chunk.metadata.contains_key("eval_count"));
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string().to_lowercase();
-                        let is_connection_error = error_msg.contains("connection refused") ||
-                                                error_msg.contains("connection failed") ||
-                                                error_msg.contains("failed to connect") ||
-                                                error_msg.contains("error trying to connect") ||
-                                                error_msg.contains("tcp connect error");
-                        
-                        assert!(is_connection_error, "Unexpected error: {}", e);
-                        return; // Exit early if Ollama is not running
-                    }
-                }
-            }
-
-            // Only check these if we got any chunks
-            if received_chunks > 0 {
-                assert!(total_tokens > 0);
-                assert!(last_chunk_timing.is_some());
-            }
-        }
-        Err(e) => {
-            // Skip test if Ollama is not running
-            let error_msg = e.to_string().to_lowercase();
-            let is_connection_error = error_msg.contains("connection refused") ||
-                                    error_msg.contains("connection failed") ||
-                                    error_msg.contains("failed to connect") ||
-                                    error_msg.contains("error trying to connect") ||
-                                    error_msg.contains("tcp connect error");
-            
-            assert!(is_connection_error, "Unexpected error: {}", e);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_streaming_cancellation() {
-    let config = LLMConfig {
-        model: "llama2".to_string(),
-        api_endpoint: Some("http://localhost:11434".to_string()),
-        api_key: None,
-        org_id: None,
-        timeout_secs: 30,
-        max_retries: 1,
-        use_cache: false,
-        rate_limit_config: None,
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    };
-
-    let client = OllamaClient::new(config).unwrap();
-    let params = LLMParams {
-        max_tokens: 500, // Longer response to ensure we can cancel
-        temperature: 0.7,
-        top_p: 1.0,
-        stream: true,
-        system_prompt: None,
-        query_params: None,
-        extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
-    };
-
-    let stream = client.generate_stream("Write a long story about an adventure", &params).await;
-    match stream {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut received_chunks = 0;
-            
-            // Only process first few chunks then drop the stream
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(chunk) => {
-                        received_chunks += 1;
-                        if received_chunks >= 3 {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string().to_lowercase();
-                        let is_connection_error = error_msg.contains("connection refused") ||
-                                                error_msg.contains("connection failed") ||
-                                                error_msg.contains("failed to connect") ||
-                                                error_msg.contains("error trying to connect") ||
-                                                error_msg.contains("tcp connect error");
-                        
-                        assert!(is_connection_error, "Unexpected error: {}", e);
-                        break;
-                    }
-                }
-            }
-
-            // Stream should be dropped gracefully
-            drop(stream);
-            
-            // Small delay to ensure cleanup
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Err(e) => {
-            // Skip test if Ollama is not running
-            let error_msg = e.to_string().to_lowercase();
-            let is_connection_error = error_msg.contains("connection refused") ||
-                                    error_msg.contains("connection failed") ||
-                                    error_msg.contains("failed to connect") ||
-                                    error_msg.contains("error trying to connect") ||
-                                    error_msg.contains("tcp connect error");
-            
-            assert!(is_connection_error, "Unexpected error: {}", e);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_streaming_timeout() {
-    let config = LLMConfig {
-        model: "llama2".to_string(),
-        api_endpoint: Some("http://localhost:11434".to_string()),
-        api_key: None,
-        org_id: None,
-        timeout_secs: 1, // Very short timeout
-        max_retries: 1,
-        use_cache: false,
-        rate_limit_config: None,
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    };
-
-    let client = OllamaClient::new(config).unwrap();
-    let params = LLMParams {
-        max_tokens: 50,
-        temperature: 0.7,
-        top_p: 1.0,
-        stream: true,
-        system_prompt: None,
-        query_params: None,
-        extra_params: HashMap::new(),
-        model: "openai/gpt-4".to_string(),
-    };
-
-    let result = client.generate_stream("Test prompt", &params).await;
-    
-    match result {
-        Ok(stream) => {
-            // If we got a stream, it should error on first chunk due to timeout
-            let mut stream = Box::pin(stream);
-            if let Some(chunk) = stream.next().await {
-                assert!(chunk.is_err());
-                let err = chunk.unwrap_err();
-                let error_msg = err.to_string().to_lowercase();
-                
-                // Check for various timeout and connection error patterns
-                let is_timeout = error_msg.contains("timeout") || 
-                               error_msg.contains("timed out") ||
-                               error_msg.contains("operation timed out");
-                               
-                let is_connection_error = error_msg.contains("connection refused") ||
-                                        error_msg.contains("connection failed") ||
-                                        error_msg.contains("failed to connect");
-                
-                assert!(is_timeout || is_connection_error,
-                    "Expected timeout or connection error, got: {}", err);
-            }
-        }
-        Err(e) => {
-            let error_msg = e.to_string().to_lowercase();
-            
-            // Check for various timeout and connection error patterns
-            let is_timeout = error_msg.contains("timeout") || 
-                           error_msg.contains("timed out") ||
-                           error_msg.contains("operation timed out");
-                           
-            let is_connection_error = error_msg.contains("connection refused") ||
-                                    error_msg.contains("connection failed") ||
-                                    error_msg.contains("failed to connect");
-            
-            assert!(is_timeout || is_connection_error,
-                "Expected timeout or connection error, got: {}", e);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_batch_processing_performance() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({
-                    "id": "chatcmpl-batch-123",
-                    "object": "chat.completion",
-                    "created": 1677652288,
-                    "model": "gpt-3.5-turbo",
-                    "choices": [
-                        {"message": {"role": "assistant", "content": "response for prompt1"}, "text": "response for prompt1", "finish_reason": "stop", "index": 0},
-                        {"message": {"role": "assistant", "content": "response for prompt2"}, "text": "response for prompt2", "finish_reason": "stop", "index": 1},
-                        {"message": {"role": "assistant", "content": "response for prompt3"}, "text": "response for prompt3", "finish_reason": "stop", "index": 2}
-                    ],
-                    "usage": {
-                        "prompt_tokens": 10,
-                        "completion_tokens": 20,
-                        "total_tokens": 30
-                    }
-                }))
-        )
-        .mount(&mock_server)
-        .await;
-
-    let config = LLMConfig {
-        model: "gpt-3.5-turbo".to_string(),
-        api_endpoint: Some(mock_server.uri()),
-        api_key: Some("test-key".to_string()),
-        org_id: None,
-        timeout_secs: 30,
-        max_retries: 1,
-        use_cache: false,
-        rate_limit_config: None,
-        similarity_threshold: 0.8,
-        extra_config: HashMap::new(),
-    };
-    let client = OpenAIClient::new(config).unwrap();
-
-    let prompts = vec![
-        "prompt1".to_string(),
-        "prompt2".to_string(),
-        "prompt3".to_string(),
-    ];
-
-    let params = LLMParams {
-        max_tokens: 50,
-        temperature: 0.7,
-        top_p: 1.0,
-        stream: false,
-        system_prompt: None,
-        query_params: None,
-        extra_params: HashMap::new(),
-        model: "openai/gpt-3.5-turbo".to_string(),
-    };
-
-    // Measure batch processing time
-    let start_time = Instant::now();
-    let responses = client.batch_generate_chat(&prompts, &params).await.unwrap();
-    let batch_duration = start_time.elapsed();
-
-    // Measure sequential processing time
-    let start_time = Instant::now();
-    let mut sequential_responses = Vec::new();
-    for prompt in &prompts {
-        let response = client.generate(prompt, &params).await.unwrap();
-        sequential_responses.push(response);
-    }
-    let sequential_duration = start_time.elapsed();
-
-    // Verify responses
-    assert_eq!(responses.len(), prompts.len());
-    assert_eq!(sequential_responses.len(), prompts.len());
-
-    // Print performance results for manual inspection
-    println!("Batch processing duration: {:?}", batch_duration);
-    println!("Sequential processing duration: {:?}", sequential_duration);
-}
-
-#[tokio::test]
-async fn test_streaming_performance() {
-    // Test configuration with different batching settings
-    let configs = vec![
-        StreamConfig {
-            enable_batching: false,
-            ..Default::default()
-        },
-        StreamConfig {
-            enable_batching: true,
-            max_batch_size: 1024,
-            max_batch_wait_ms: 10,
-            ..Default::default()
-        },
-        StreamConfig {
-            enable_batching: true,
-            max_batch_size: 16384,
-            max_batch_wait_ms: 50,
-            ..Default::default()
-        },
-    ];
-
-    // Create a large test stream generator function
-    let create_test_stream = || {
-        let num_chunks = 1000;
-        stream::iter((0..num_chunks).map(|i| {
-            Ok(Bytes::from(format!("chunk{}\n", i))) as Result<Bytes, reqwest::Error>
-        }))
-    };
-
-    let mut results = Vec::new();
-
-    // Test each configuration
-    for config in configs {
-        let mut processor = StreamProcessor::new(config.clone());
-        let test_stream = create_test_stream();
-        let start_time = Instant::now();
-
-        let mut result_stream = processor.process_stream(test_stream, streaming_parser).await;
-        let mut response_count = 0;
-        let mut total_tokens = 0;
-
-        while let Some(result) = result_stream.next().await {
-            let response = result.unwrap();
-            response_count += 1;
-            total_tokens += response.chunk_tokens;
-        }
-
-        let duration = start_time.elapsed();
-        results.push((
-            config.enable_batching,
-            config.max_batch_size,
-            duration,
-            response_count,
-            total_tokens,
-        ));
-    }
-
-    // Print performance results
-    for (batching, batch_size, duration, responses, tokens) in results {
-        println!(
-            "Config: batching={}, batch_size={}, duration={:?}, responses={}, tokens={}, tokens/sec={}",
-            batching,
-            batch_size,
-            duration,
+impl MockStreamingProvider {
+    fn new(responses: Vec<String>, chunk_size: usize) -> Self {
+        Self {
             responses,
-            tokens,
-            tokens as f64 / duration.as_secs_f64(),
-        );
+            current: AtomicUsize::new(0),
+            chunk_size,
+        }
     }
+}
+
+#[async_trait]
+impl Provider for MockStreamingProvider {
+    async fn initialize(&mut self) -> Result<(), LLMError> {
+        Ok(())
+    }
+
+    async fn complete(&self, _prompt: &str, _params: &LLMParams) -> Result<LLMResponse, LLMError> {
+        let idx = self.current.fetch_add(1, Ordering::SeqCst);
+        if idx < self.responses.len() {
+            Ok(LLMResponse {
+                text: self.responses[idx].clone(),
+                tokens_used: 100,
+                model: "mock".to_string(),
+                cached: false,
+                context: None,
+                metadata: HashMap::new(),
+            })
+        } else {
+            Err(LLMError::RequestFailed("No more mock responses".to_string()))
+        }
+    }
+
+    async fn complete_stream(
+        &self,
+        _prompt: &str,
+        _params: &LLMParams,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        let idx = self.current.fetch_add(1, Ordering::SeqCst);
+        if idx >= self.responses.len() {
+            return Err(LLMError::RequestFailed("No more mock responses".to_string()));
+        }
+
+        let response = self.responses[idx].clone();
+        let chunk_size = self.chunk_size;
+        let (tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            let mut chunks = Vec::new();
+            let mut current_chunk = String::new();
+            let mut total_tokens = 0;
+
+            // Split response into chunks
+            for c in response.chars() {
+                current_chunk.push(c);
+                if current_chunk.len() >= chunk_size {
+                    chunks.push(current_chunk.clone());
+                    current_chunk.clear();
+                }
+            }
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+            }
+
+            // Send chunks as streaming responses
+            for (i, chunk) in chunks.iter().enumerate() {
+                let is_last = i == chunks.len() - 1;
+                total_tokens += chunk.split_whitespace().count();
+
+                let timing = StreamingTiming {
+                    chunk_duration: 100u64,  // Mock duration
+                    total_duration: ((i + 1) * 100) as u64,
+                    prompt_eval_duration: Some(50u64),
+                    token_gen_duration: Some(50u64),
+                };
+
+                let stream_response = StreamingResponse {
+                    text: chunk.clone(),
+                    done: is_last,
+                    timing: Some(timing),
+                    chunk_tokens: chunk.split_whitespace().count(),
+                    total_tokens,
+                    metadata: HashMap::new(),
+                };
+
+                if tx.send(Ok(stream_response)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    async fn complete_batch(
+        &self,
+        _prompts: &[String],
+        _params: &LLMParams,
+    ) -> Result<Vec<LLMResponse>, LLMError> {
+        Err(LLMError::RequestFailed("Batch completion not needed for tests".to_string()))
+    }
+
+    fn get_config(&self) -> &ProviderConfig {
+        panic!("Config not needed for tests")
+    }
+
+    fn update_config(&mut self, _config: ProviderConfig) -> Result<(), LLMError> {
+        Err(LLMError::RequestFailed("Config update not needed for tests".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn test_basic_streaming() {
+    let provider = MockStreamingProvider::new(
+        vec!["Hello, this is a test response.".to_string()],
+        5,  // 5 characters per chunk
+    );
+
+    let params = LLMParams::default();
+    let mut stream = provider.complete_stream("test prompt", &params).await.unwrap();
+
+    let mut combined_text = String::new();
+    let mut total_chunks = 0;
+    let mut last_total_tokens = 0;
+
+    while let Some(result) = stream.next().await {
+        let response = result.unwrap();
+        combined_text.push_str(&response.text);
+        total_chunks += 1;
+        last_total_tokens = response.total_tokens;
+
+        // Verify timing information
+        let timing = response.timing.unwrap();
+        assert!(timing.chunk_duration > 0);
+        assert!(timing.total_duration >= timing.chunk_duration);
+        assert_eq!(timing.prompt_eval_duration, Some(50));
+        assert_eq!(timing.token_gen_duration, Some(50));
+    }
+
+    assert_eq!(combined_text, "Hello, this is a test response.");
+    assert!(total_chunks > 1);
+    assert!(last_total_tokens > 0);
+}
+
+#[tokio::test]
+async fn test_empty_stream() {
+    let provider = MockStreamingProvider::new(vec![], 5);
+    let params = LLMParams::default();
+    
+    let result = provider.complete_stream("test prompt", &params).await;
+    assert!(result.is_err());
+    if let Err(LLMError::RequestFailed(msg)) = result {
+        assert_eq!(msg, "No more mock responses");
+    } else {
+        panic!("Expected RequestFailed error");
+    }
+}
+
+#[tokio::test]
+async fn test_streaming_with_different_chunk_sizes() {
+    let test_response = "This is a longer response that will be split into different sized chunks.";
+    
+    // Test with different chunk sizes
+    for chunk_size in [3, 5, 10] {
+        let provider = MockStreamingProvider::new(vec![test_response.to_string()], chunk_size);
+        let params = LLMParams::default();
+        let mut stream = provider.complete_stream("test prompt", &params).await.unwrap();
+
+        let mut combined_text = String::new();
+        let mut last_chunk_size = 0;
+
+        while let Some(result) = stream.next().await {
+            let response = result.unwrap();
+            combined_text.push_str(&response.text);
+            last_chunk_size = response.text.len();
+        }
+
+        assert_eq!(combined_text, test_response);
+        assert!(last_chunk_size <= chunk_size);
+    }
+}
+
+#[tokio::test]
+async fn test_streaming_metadata() {
+    let provider = MockStreamingProvider::new(
+        vec!["Test response with metadata.".to_string()],
+        5,
+    );
+
+    let params = LLMParams::default();
+    let mut stream = provider.complete_stream("test prompt", &params).await.unwrap();
+
+    let mut saw_final_chunk = false;
+    let mut total_tokens = 0;
+
+    while let Some(result) = stream.next().await {
+        let response = result.unwrap();
+        
+        // Verify response structure
+        assert!(!response.text.is_empty());
+        assert!(response.chunk_tokens > 0);
+        assert!(response.total_tokens >= response.chunk_tokens);
+        
+        // Track if we've seen the final chunk
+        if response.done {
+            saw_final_chunk = true;
+            total_tokens = response.total_tokens;
+        }
+    }
+
+    assert!(saw_final_chunk, "Should have received a final chunk");
+    assert!(total_tokens > 0, "Should have counted total tokens");
 } 

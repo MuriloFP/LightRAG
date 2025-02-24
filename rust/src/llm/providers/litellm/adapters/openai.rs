@@ -6,27 +6,29 @@ use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 
 use crate::llm::{
-    LLMError, LLMParams, LLMResponse, LLMConfig,
+    LLMError, LLMParams, LLMResponse,
+    Provider,
+    ProviderConfig,
 };
-use crate::types::llm::{StreamingResponse, LLMClient};
-use crate::llm::providers::openai::OpenAIClient;
+use crate::types::llm::StreamingResponse;
+use crate::llm::providers::openai::OpenAIProvider;
 use crate::llm::ProviderAdapter;
 use crate::llm::LLMProvider;
 
 /// OpenAI provider adapter implementation
 pub struct OpenAIAdapter {
-    client: OpenAIClient,
-    config: Arc<LLMConfig>,
+    provider: OpenAIProvider,
+    config: Arc<ProviderConfig>,
 }
 
 impl OpenAIAdapter {
     /// Create a new OpenAI adapter
-    pub fn new(client: OpenAIClient, config: LLMConfig) -> Result<Self, LLMError> {
+    pub fn new(provider: OpenAIProvider, config: ProviderConfig) -> Result<Self, LLMError> {
         if config.api_key.is_none() {
             return Err(LLMError::ConfigError("OpenAI API key is required".to_string()));
         }
         Ok(Self {
-            client,
+            provider,
             config: Arc::new(config),
         })
     }
@@ -62,21 +64,45 @@ impl OpenAIAdapter {
 }
 
 #[async_trait]
-impl ProviderAdapter for OpenAIAdapter {
+impl Provider for OpenAIAdapter {
+    async fn initialize(&mut self) -> Result<(), LLMError> {
+        self.provider.initialize().await
+    }
+
     async fn complete(&self, prompt: &str, params: &LLMParams) -> Result<LLMResponse, LLMError> {
-        self.client.generate(prompt, params)
-            .await
-            .map_err(|e| e)
+        self.provider.complete(prompt, params).await
     }
 
-    async fn complete_stream(&self, prompt: &str, params: &LLMParams) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
-        self.client.generate_stream(prompt, params)
-            .await
-            .map_err(|e| e)
+    async fn complete_stream(
+        &self,
+        prompt: &str,
+        params: &LLMParams,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamingResponse, LLMError>> + Send>>, LLMError> {
+        self.provider.complete_stream(prompt, params).await
     }
 
+    async fn complete_batch(
+        &self,
+        prompts: &[String],
+        params: &LLMParams,
+    ) -> Result<Vec<LLMResponse>, LLMError> {
+        self.provider.complete_batch(prompts, params).await
+    }
+
+    fn get_config(&self) -> &ProviderConfig {
+        &self.config
+    }
+
+    fn update_config(&mut self, config: ProviderConfig) -> Result<(), LLMError> {
+        self.config = Arc::new(config);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for OpenAIAdapter {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LLMError> {
-        self.client.create_embeddings(texts).await
+        self.provider.create_embeddings(texts).await
     }
 
     fn supports_streaming(&self) -> bool {
@@ -90,9 +116,5 @@ impl ProviderAdapter for OpenAIAdapter {
 
     fn provider_name(&self) -> &str {
         "OpenAI"
-    }
-
-    fn get_config(&self) -> &LLMConfig {
-        &self.config
     }
 } 

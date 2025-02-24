@@ -4,8 +4,8 @@ use serde::{Serialize, Deserialize};
 use crate::llm::LLMError;
 use crate::llm::LLMResponse;
 use crate::types::llm::StreamingResponse;
-use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use super::types::CacheType;
+use flate2::{Compress, Decompress, FlushCompress, FlushDecompress};
 
 /// Entry in the cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,16 +70,15 @@ pub struct CacheEntry {
 impl CacheEntry {
     /// Create a new cache entry
     pub fn new(response: LLMResponse, ttl: Option<Duration>, cache_type: Option<CacheType>) -> Self {
-        let now = SystemTime::now();
         Self {
             response,
-            created_at: now,
-            expires_at: ttl.map(|ttl| now + ttl),
+            created_at: SystemTime::now(),
+            expires_at: ttl.map(|ttl| SystemTime::now() + ttl),
             embedding: None,
             access_count: 0,
-            last_accessed: now,
+            last_accessed: SystemTime::now(),
             llm_verified: false,
-            cache_type: cache_type.unwrap_or_default(),
+            cache_type: cache_type.unwrap_or(CacheType::Memory),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -95,22 +94,25 @@ impl CacheEntry {
     pub fn new_streaming(chunks: Vec<StreamingResponse>, ttl: Option<Duration>, cache_type: Option<CacheType>) -> Self {
         let now = SystemTime::now();
         let total_text: String = chunks.iter().map(|c| c.text.clone()).collect();
-        let total_tokens = chunks.iter().map(|c| c.chunk_tokens).sum();
+        let total_tokens: usize = chunks.iter().map(|c| c.chunk_tokens).sum();
         let total_duration = chunks.last()
             .and_then(|c| c.timing.as_ref())
             .map(|t| t.total_duration);
+        let model = chunks.last()
+            .and_then(|c| c.metadata.get("model"))
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        let metadata = chunks.last()
+            .map(|c| c.metadata.clone())
+            .unwrap_or_default();
 
         let response = LLMResponse {
             text: total_text,
             tokens_used: total_tokens,
-            model: chunks.last()
-                .map(|c| c.metadata.get("model").cloned().unwrap_or_default())
-                .unwrap_or_default(),
+            model,
             cached: true,
             context: None,
-            metadata: chunks.last()
-                .map(|c| c.metadata.clone())
-                .unwrap_or_default(),
+            metadata,
         };
 
         Self {
@@ -121,7 +123,7 @@ impl CacheEntry {
             access_count: 0,
             last_accessed: now,
             llm_verified: false,
-            cache_type: cache_type.unwrap_or_default(),
+            cache_type: cache_type.unwrap_or(CacheType::Memory),
             checksum: None,
             compressed_data: None,
             original_size: None,
@@ -161,8 +163,19 @@ impl CacheEntry {
             
             self.original_size = Some(serialized.len());
             
-            let compressed = compress_prepend_size(&serialized);
-            self.compressed_data = Some(compressed);
+            let mut compressor = Compress::new(flate2::Compression::default(), true);
+            let mut compressed = Vec::with_capacity(serialized.len());
+            compressor.compress_vec(
+                &serialized,
+                &mut compressed,
+                FlushCompress::Finish,
+            ).map_err(|e| LLMError::CacheError(format!("Failed to compress data: {}", e)))?;
+            
+            // Prepend size
+            let mut size_bytes = (serialized.len() as u32).to_le_bytes().to_vec();
+            size_bytes.extend(compressed);
+            
+            self.compressed_data = Some(size_bytes);
         }
         Ok(())
     }
@@ -179,8 +192,17 @@ impl CacheEntry {
                 return Ok(&self.response);
             }
 
-            let decompressed = decompress_size_prepended(compressed)
-                .map_err(|e| LLMError::CacheError(format!("Failed to decompress data: {}", e)))?;
+            // Extract size from first 4 bytes
+            let size = u32::from_le_bytes(compressed[0..4].try_into().unwrap()) as usize;
+            let compressed = &compressed[4..];
+
+            let mut decompressor = Decompress::new(true);
+            let mut decompressed = Vec::with_capacity(size);
+            decompressor.decompress_vec(
+                compressed,
+                &mut decompressed,
+                FlushDecompress::Finish,
+            ).map_err(|e| LLMError::CacheError(format!("Failed to decompress data: {}", e)))?;
 
             let response: LLMResponse = serde_json::from_slice(&decompressed)
                 .map_err(|e| LLMError::CacheError(format!("Failed to deserialize response: {}", e)))?;

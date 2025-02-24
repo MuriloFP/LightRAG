@@ -116,7 +116,7 @@ impl OpenAIEmbeddingProvider {
     async fn check_rate_limit(&self, tokens: u32) -> Result<Option<RateLimit>, EmbeddingError> {
         if let Some(rate_limiter) = &self.rate_limiter {
             let rate_limit = rate_limiter.write().await
-                .try_acquire(tokens)
+                .acquire_permit(tokens)
                 .await
                 .map_err(|e| EmbeddingError::RateLimitExceeded(e.to_string()))?;
             Ok(Some(rate_limit))

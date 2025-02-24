@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tiktoken_rs::cl100k_base;
-use crate::types::llm::{LLMClient, LLMParams};
+use crate::llm::{LLMParams, Provider};
 use std::sync::Arc;
 
 /// Errors that can occur during keyword extraction
@@ -217,16 +217,16 @@ impl KeywordExtractor for BasicKeywordExtractor {
 /// LLM-based implementation of keyword extraction
 pub struct LLMKeywordExtractor {
     config: KeywordConfig,
-    llm_client: Arc<dyn LLMClient>,
+    provider: Arc<Box<dyn Provider>>,
     llm_params: LLMParams,
 }
 
 impl LLMKeywordExtractor {
-    /// Create a new LLMKeywordExtractor with the given configuration and client
-    pub fn new(config: KeywordConfig, llm_client: Arc<dyn LLMClient>, llm_params: LLMParams) -> Self {
+    /// Create a new LLMKeywordExtractor with the given configuration and provider
+    pub fn new(config: KeywordConfig, provider: Arc<Box<dyn Provider>>, llm_params: LLMParams) -> Self {
         Self { 
             config,
-            llm_client,
+            provider,
             llm_params,
         }
     }
@@ -309,7 +309,7 @@ impl KeywordExtractor for LLMKeywordExtractor {
         }
 
         let prompt = self.generate_prompt(content, None);
-        let response = self.llm_client.generate(&prompt, &self.llm_params)
+        let response = self.provider.complete(&prompt, &self.llm_params)
             .await
             .map_err(|e| KeywordError::LLMError(e.to_string()))?;
 
@@ -326,7 +326,7 @@ impl KeywordExtractor for LLMKeywordExtractor {
         }
 
         let prompt = self.generate_prompt(content, Some(history));
-        let response = self.llm_client.generate(&prompt, &self.llm_params)
+        let response = self.provider.complete(&prompt, &self.llm_params)
             .await
             .map_err(|e| KeywordError::LLMError(e.to_string()))?;
 
