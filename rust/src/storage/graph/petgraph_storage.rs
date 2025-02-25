@@ -909,27 +909,53 @@ impl PetgraphStorage {
 #[async_trait]
 impl GraphStorage for PetgraphStorage {
     async fn finalize(&mut self) -> Result<()> {
+        println!("PetgraphStorage: Starting finalize");
+        
         // Create handler and write with pretty printing
+        println!("PetgraphStorage: Creating GraphMlHandler for {} nodes and {} edges", 
+                 self.graph.node_count(), self.graph.edge_count());
         let handler = GraphMlHandler::new(self.graph.clone()).pretty_print(true);
         let file_path = self.file_path.clone();
         
-        info!("Saving graph with {} nodes and {} edges to {}", 
-              self.graph.node_count(), 
-              self.graph.edge_count(),
-              file_path.display());
+        println!("PetgraphStorage: Saving graph to {}", file_path.display());
 
         // Write graph to file
-        tokio::task::spawn_blocking(move || {
-            handler.write_graphml(&file_path)
-        }).await??;
+        println!("PetgraphStorage: Spawning blocking task to write GraphML");
+        let write_result = tokio::task::spawn_blocking(move || {
+            println!("PetgraphStorage: Starting to write GraphML file");
+            let result = handler.write_graphml(&file_path);
+            match &result {
+                Ok(_) => println!("PetgraphStorage: GraphML file written successfully"),
+                Err(e) => println!("PetgraphStorage: Error writing GraphML file: {:?}", e),
+            }
+            result
+        }).await;
+        
+        // Check for errors in the join handle
+        println!("PetgraphStorage: Checking task result");
+        match write_result {
+            Ok(result) => match result {
+                Ok(_) => println!("PetgraphStorage: Task completed successfully"),
+                Err(e) => {
+                    println!("PetgraphStorage: Task returned error: {:?}", e);
+                    return Err(e);
+                }
+            },
+            Err(e) => {
+                println!("PetgraphStorage: Task join error: {:?}", e);
+                return Err(Error::Storage(format!("Failed to join task: {}", e)));
+            }
+        }
 
         // Verify file was written
+        println!("PetgraphStorage: Verifying file was written");
         let check_path = self.file_path.clone();
         if !check_path.exists() {
+            println!("PetgraphStorage: File does not exist after write");
             return Err(Error::Storage("Failed to write graph file".to_string()));
         }
 
-        info!("Successfully saved graph to {}", self.file_path.display());
+        println!("PetgraphStorage: Finalize completed successfully");
         Ok(())
     }
 

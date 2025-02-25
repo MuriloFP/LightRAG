@@ -114,11 +114,37 @@ impl KVStorage for JsonKVStorage {
     }
 
     async fn finalize(&mut self) -> Result<()> {
-        use tokio::fs;
+        println!("JsonKVStorage: Starting finalize for namespace '{}'", self.namespace);
+        
+        // Acquire lock for thread safety
+        println!("JsonKVStorage: Acquiring lock");
         let _guard = self.lock.lock().await;
-        // Serialize the data map to pretty JSON and write it to file
-        let content = serde_json::to_string_pretty(&self.data)?;
-        fs::write(&self.file_path, content).await?;
+        println!("JsonKVStorage: Lock acquired");
+        
+        // Serialize the data map to pretty JSON
+        println!("JsonKVStorage: Serializing {} data entries", self.data.len());
+        let content = match serde_json::to_string_pretty(&self.data) {
+            Ok(content) => {
+                println!("JsonKVStorage: Serialization successful, content size: {} bytes", content.len());
+                content
+            },
+            Err(e) => {
+                println!("JsonKVStorage: Serialization failed: {:?}", e);
+                return Err(e.into());
+            }
+        };
+        
+        // Write to file
+        println!("JsonKVStorage: Writing to file: {}", self.file_path);
+        match tokio::fs::write(&self.file_path, content).await {
+            Ok(_) => println!("JsonKVStorage: File write successful"),
+            Err(e) => {
+                println!("JsonKVStorage: File write failed: {:?}", e);
+                return Err(e.into());
+            }
+        }
+        
+        println!("JsonKVStorage: Finalize completed for namespace '{}'", self.namespace);
         Ok(())
     }
 

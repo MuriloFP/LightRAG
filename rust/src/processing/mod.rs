@@ -6,7 +6,7 @@
 //! - Content processing
 //! - Document format handling
 
-mod status;
+pub mod status;
 mod chunking;
 mod types;
 mod validation;

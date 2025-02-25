@@ -1,7 +1,11 @@
 use thiserror::Error;
 use crate::llm::cache::backend::CacheError;
 use crate::llm::LLMError;
-use crate::processing::summary::SummaryError;
+use crate::processing::SummaryError;
+use crate::processing::ChunkingError;
+use crate::types::embeddings::EmbeddingError;
+use crate::processing::DocumentStatusError;
+use tokio::sync::AcquireError;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -44,6 +48,10 @@ pub enum Error {
     /// LLM errors
     #[error("LLM error: {0}")]
     LLM(LLMError),
+
+    /// Other errors
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -96,5 +104,30 @@ impl From<SummaryError> for Error {
             SummaryError::GenerationFailed(msg) => Error::LLM(LLMError::Other(format!("Summary generation failed: {}", msg))),
             SummaryError::KeywordExtractionFailed(msg) => Error::LLM(LLMError::Other(format!("Keyword extraction failed: {}", msg))),
         }
+    }
+}
+
+// Add these implementations
+impl From<DocumentStatusError> for Error {
+    fn from(err: DocumentStatusError) -> Self {
+        Error::Other(format!("Document status error: {}", err))
+    }
+}
+
+impl From<ChunkingError> for Error {
+    fn from(err: ChunkingError) -> Self {
+        Error::Other(format!("Chunking error: {}", err))
+    }
+}
+
+impl From<EmbeddingError> for Error {
+    fn from(err: EmbeddingError) -> Self {
+        Error::Other(format!("Embedding error: {}", err))
+    }
+}
+
+impl From<AcquireError> for Error {
+    fn from(err: AcquireError) -> Self {
+        Error::Other(format!("Semaphore acquire error: {}", err))
     }
 } 

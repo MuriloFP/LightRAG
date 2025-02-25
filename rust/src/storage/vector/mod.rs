@@ -411,9 +411,28 @@ impl VectorStorage for NanoVectorStorage {
     }
 
     async fn finalize(&mut self) -> Result<()> {
-        // Save both HNSW index and vector storage to files
-        self.hnsw.save()?;
-        self.save_storage()?;
+        println!("NanoVectorStorage: Starting finalize");
+        
+        // Acquire lock for file operations
+        println!("NanoVectorStorage: Acquiring save lock");
+        let _guard = self.save_lock.lock().await;
+        println!("NanoVectorStorage: Save lock acquired");
+        
+        // Save HNSW index
+        println!("NanoVectorStorage: Saving HNSW index with {} nodes", self.hnsw.nodes.len());
+        match self.hnsw.save() {
+            Ok(_) => println!("NanoVectorStorage: HNSW index saved successfully"),
+            Err(e) => println!("NanoVectorStorage: Error saving HNSW index: {:?}", e),
+        }
+        
+        // Save vector storage
+        println!("NanoVectorStorage: Saving vector storage with {} vectors", self.storage.len());
+        match self.save_storage() {
+            Ok(_) => println!("NanoVectorStorage: Vector storage saved successfully"),
+            Err(e) => println!("NanoVectorStorage: Error saving vector storage: {:?}", e),
+        }
+        
+        println!("NanoVectorStorage: Finalize completed");
         Ok(())
     }
 
