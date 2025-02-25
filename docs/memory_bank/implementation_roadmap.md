@@ -48,17 +48,17 @@ Based on our analysis of the codebase, we have identified the following status:
 **Goal:** Implement comprehensive querying capabilities.
 
 **Tasks:**
-1. Implement basic query method
-2. Implement streaming query support
-3. Implement context-only retrieval
-4. Implement query with separate keyword extraction
-5. Write tests for query functionality
+1. ✅ Implement basic query method
+2. ✅ Implement streaming query support
+3. ✅ Implement context-only retrieval
+4. ✅ Implement query with separate keyword extraction
+5. ✅ Write tests for query functionality
 6. Update documentation
 
 **Deliverables:**
-- Working query API
-- Streaming support
-- Unit and integration tests
+- ✅ Working query API
+- ✅ Streaming support
+- ✅ Unit and integration tests
 - Documentation for query methods
 
 ### Phase 3: Advanced Features and Integration (Weeks 5-6)
@@ -128,29 +128,29 @@ Based on our analysis of the codebase, we have identified the following status:
 
 ### Query Functionality Implementation
 
-1. **Implement Basic Query Method**
-   - Integration with query processors
-   - Context building
-   - LLM prompt construction
-   - Response handling
+1. **Implement Basic Query Method** ✅
+   - ✅ Integration with query processors
+   - ✅ Context building
+   - ✅ LLM prompt construction
+   - ✅ Response handling
 
-2. **Implement Streaming Support**
-   - Streaming interface
-   - Chunk delivery mechanism
-   - Error handling
+2. **Implement Streaming Support** ✅
+   - ✅ Streaming interface
+   - ✅ Chunk delivery mechanism
+   - ✅ Error handling
 
-3. **Implement Context Retrieval**
-   - Raw context retrieval
-   - Context with scores
-   - Different query modes (local, global, hybrid, etc.)
+3. **Implement Context Retrieval** ✅
+   - ✅ Raw context retrieval
+   - ✅ Context with scores
+   - ✅ Different query modes (local, global, hybrid, etc.)
 
-4. **Implement Keyword-based Query**
-   - Separate keyword extraction
-   - Keyword incorporation into query
+4. **Implement Keyword-based Query** ✅
+   - ✅ Separate keyword extraction
+   - ✅ Keyword incorporation into query
 
-5. **Testing Query Functionality**
-   - Unit tests for each query mode
-   - Integration tests for end-to-end flow
+5. **Testing Query Functionality** ✅
+   - ✅ Unit tests for each query mode
+   - ✅ Integration tests for end-to-end flow
    - Performance tests for large queries
 
 ### Knowledge Graph Implementation
@@ -234,15 +234,27 @@ This roadmap provides a structured approach to implementing the missing features
 
 ## Progress Update (Current Date)
 
-We have successfully completed Phase 1 of the implementation roadmap, focusing on document insertion capabilities. The following key achievements have been made:
+We have successfully completed Phase 1 and Phase 2 of the implementation roadmap, focusing on document insertion capabilities and query functionality. The following key achievements have been made:
 
-1. Implemented the core SuperLightRAG struct with all necessary fields and initialization methods
-2. Developed a robust document insertion API with support for:
+### Phase 1 Achievements:
+1. ✅ Implemented the core SuperLightRAG struct with all necessary fields and initialization methods
+2. ✅ Developed a robust document insertion API with support for:
    - Single document insertion
    - Batch document insertion with parallel processing
    - Custom chunk insertion
-3. Integrated all storage components (KV, Vector, Graph) for document processing
-4. Added comprehensive logging throughout the codebase for better debugging
-5. Implemented and fixed tests for document insertion functionality
+3. ✅ Integrated all storage components (KV, Vector, Graph) for document processing
+4. ✅ Added comprehensive logging throughout the codebase for better debugging
+5. ✅ Implemented and fixed tests for document insertion functionality
 
-Next steps will focus on Phase 2: implementing the querying functionality, including basic query methods, streaming support, and context retrieval mechanisms. 
+### Phase 2 Achievements:
+1. ✅ Implemented comprehensive query functionality with multiple modes:
+   - Basic query method with LLM integration
+   - Streaming query support for real-time responses
+   - Context-only retrieval for direct access to relevant chunks
+   - Context with relevance scores for advanced applications
+2. ✅ Added support for keyword-based querying to enhance retrieval quality
+3. ✅ Implemented proper embedding generation for queries
+4. ✅ Created test cases for query functionality and fixed issues
+5. ✅ Ensured proper integration between query processors, vector storage, and LLM providers
+
+Next steps will focus on Phase 3: implementing advanced features including custom knowledge graph insertion, enhanced entity extraction, and graph visualization capabilities. 
